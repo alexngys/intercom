@@ -159,8 +159,9 @@ ID=$("$S" open --me a --topic test | grep -oE '[a-f0-9]{6}-[0-9T]+Z' | head -1)
 |---|---|
 | `open --me <label> [--topic ...]` | Create a channel; prints its id + a join prompt |
 | `send --me <label> --id <id> (--msg ... \| --json ... \| -) [--watch]` | Post a message; `--watch` re-arms the watcher in the same call; `--json` sends a validated typed payload |
-| `read --me <label> --id <id>` | Print messages newer than your watermark |
-| `watch --me <label> --id <id>` | Block (background) until the other side writes; exits `0`=new msg, `10`=1h idle (alerts user), `20`=closed |
+| `read --me <label> --id <id>` | Print messages newer than your watermark, and advance it |
+| `tail --id <id> [-n N] [--me <label>]` | Raw last-N messages straight from the log — every message, ignores/touches no watermark; recovery / source-of-truth view |
+| `watch --me <label> --id <id>` | Block (background) until the other side writes; a **doorbell** — shows new messages but does not advance your watermark. Exits `0`=new msg, `10`=1h idle (alerts user), `20`=closed |
 | `status [--me <label>] --id <id>` | Read-receipts: how far each participant has read (no write, no wake) |
 | `list [--me <label>]` | All channels + participants; with `--me`, an unread count |
 | `close --me <label> --id <id>` | Post a close marker; the other watcher exits `20` |

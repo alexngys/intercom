@@ -190,6 +190,7 @@ touch_stamp() {
 # Arg parsing (shared)
 # ----------------------------------------------------------------------------
 ME="" ; ID="" ; TOPIC="" ; MSG="" ; JSON="" ; READ_STDIN=0 ; WATCH_AFTER=0
+PEEK=0 ; TAIL_N=20
 parse_args() {
   while (( $# )); do
     case "$1" in
@@ -199,6 +200,8 @@ parse_args() {
       --msg)   MSG="$2"; shift 2 ;;
       --json)  JSON="$2"; shift 2 ;;
       --watch) WATCH_AFTER=1; shift ;;
+      --peek)  PEEK=1; shift ;;        # print without advancing the watermark
+      -n)      TAIL_N="$2"; shift 2 ;; # tail: how many recent messages to show
       -)       READ_STDIN=1; shift ;;
       *)       die "unknown argument: $1" ;;
     esac
@@ -307,7 +310,16 @@ cmd_send() {
   fi
 }
 
-# Print messages with seq > watermark and from != me; advance watermark.
+# Print messages with seq > watermark and from != me; advance the watermark
+# UNLESS --peek. The watermark (a durable file under .state/) is the "I've seen
+# this" ACK; stdout is the ephemeral delivery. A backgrounded watcher can be
+# SIGTERMed at a turn boundary AFTER it advanced the watermark but BEFORE its
+# stdout reached the model — durable ACK, lost delivery => the message is
+# swallowed forever. So the killable watcher path reads with --peek (delivers,
+# never ACKs); the watermark only advances in a foreground `read` (whose output
+# the harness reliably captures) or when you `send` a reply (which advances your
+# watermark past everything inbound). Losing a --peek's output costs nothing:
+# the watermark hasn't moved, so `read`/`tail` re-delivers.
 cmd_read() {
   parse_args "$@"
   [[ -n "$ME" ]] || die "read requires --me <label>"
@@ -339,7 +351,44 @@ cmd_read() {
     { if (printing) print }
   ' "$path"
 
-  set_watermark "$ME" "$ID" "$top"
+  (( PEEK )) || set_watermark "$ME" "$ID" "$top"
+}
+
+# Raw recovery view: print the last -n messages (default 20) straight from the
+# append-only channel file — EVERY message, from anyone, regardless of any
+# watermark, and touching NO state (no read, no write, no wake). This is the
+# source of truth: because `watch`/`read` can never hide a message from it, run
+# `tail` after a watcher dies (exit 143/144 or an empty "no new messages") to
+# confirm nothing was swallowed. Own messages are shown too, so it doubles as a
+# full transcript. --me is optional and only used to tag "[you]".
+cmd_tail() {
+  parse_args "$@"
+  [[ -n "$ID" ]] || die "tail requires --id <id>"
+  local path; path="$(require_channel "$ID")"
+  local top closer
+  top="$(max_seq "$path")"; top="${top:-0}"
+  closer="$(closed_by "$path")"
+  echo "channel $ID | latest:seq $top | showing last $TAIL_N${closer:+ | CLOSED by $closer}"
+  awk -v n="$TAIL_N" -v me="$ME" '
+    /^===== MSG [0-9]+ \| from:/ {
+      c++; seq[c] = $3
+      f = $5; sub(/^from:/, "", f); frm[c] = f
+      typ[c] = ""
+      for (i = 6; i <= NF; i++) if ($i ~ /^type:/) { t = $i; sub(/^type:/, "", t); typ[c] = t }
+      body[c] = ""; inblk = 1; next
+    }
+    /^===== END [0-9]+ =====/ { inblk = 0; next }
+    { if (inblk) body[c] = body[c] $0 "\n" }
+    END {
+      if (c == 0) { print "(no messages yet)"; exit }
+      start = c - n + 1; if (start < 1) start = 1
+      for (i = start; i <= c; i++) {
+        you = (me != "" && frm[i] == me) ? " [you]" : ""
+        print frm[i] "#" seq[i] (typ[i] == "" ? "" : " [" typ[i] "]") you ":"
+        printf "%s", body[i]; print ""
+      }
+    }
+  ' "$path"
 }
 
 # Block until the comms dir changes or `timeout` secs elapse.
@@ -387,7 +436,8 @@ _watch_check() {
   fi
   if (( top > wm )) && [[ "$author" != "$ME" ]]; then
     echo "[intercom] new on $ID:"       # per-message "from#seq:" carries the rest
-    cmd_read --me "$ME" --id "$ID"
+    cmd_read --me "$ME" --id "$ID" --peek   # doorbell: deliver, but DON'T advance
+    echo "[intercom] (shown via watcher; watermark unchanged — your reply's \`send\` acks it, or run \`read\`/\`tail\` if this output was truncated)"
     exit $EX_NEW
   fi
   return 0
@@ -507,12 +557,13 @@ cmd_close() {
 # ----------------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------------
-[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|watch|status|list|close} [args]"
+[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|tail|watch|status|list|close} [args]"
 sub="$1"; shift || true
 case "$sub" in
   open)   cmd_open   "$@" ;;
   send)   cmd_send   "$@" ;;
   read)   cmd_read   "$@" ;;
+  tail)   cmd_tail   "$@" ;;
   watch)  cmd_watch  "$@" ;;
   status) cmd_status "$@" ;;
   list)   cmd_list   "$@" ;;
