@@ -92,6 +92,36 @@ IDR="$(newid A)"
 eq "send --watch exit" "$?" "0"
 [[ -d "$WORK/.locks/$IDR" ]] && bad "send --watch left lock" || ok "send --watch released lock"
 
+echo "== read --peek: delivers without advancing watermark =="
+IDP="$(newid A)"; "$S" send --me A --id "$IDP" --msg peekmsg >/dev/null
+out="$("$S" read --me B --id "$IDP" --peek 2>/dev/null)"; has "peek delivers content" "$out" "peekmsg"
+out="$("$S" read --me B --id "$IDP" 2>/dev/null)"; has "peek left it unread (re-delivers)" "$out" "peekmsg"
+out="$("$S" read --me B --id "$IDP" 2>/dev/null)"; has "non-peek read then advances" "$out" "no new messages"
+
+echo "== watcher is a doorbell: catching a msg must NOT swallow it (regression) =="
+IDD="$(newid A)"
+( sleep 1; "$S" send --me B --id "$IDD" --msg confirmed >/dev/null 2>&1 ) &
+out="$("${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me A --id "$IDD" 2>/dev/null)"
+has "watcher doorbell shows the msg" "$out" "confirmed"
+# The fix: watcher used --peek, so it did NOT advance A's watermark. A foreground
+# read must therefore still RECOVER the message (old code swallowed it here).
+out="$("$S" read --me A --id "$IDD" 2>/dev/null)"; has "foreground read recovers (no swallow)" "$out" "confirmed"
+
+echo "== tail: watermark-free recovery view =="
+IDL="$(newid A)"
+"$S" send --me A --id "$IDL" --msg t1 >/dev/null
+"$S" send --me B --id "$IDL" --msg t2 >/dev/null
+"$S" read --me A --id "$IDL" >/dev/null 2>&1     # advance A fully
+out="$("$S" tail --id "$IDL" --me A 2>/dev/null)"
+has "tail shows inbound regardless of watermark" "$out" "t2"
+has "tail shows own messages too" "$out" "t1"
+has "tail tags own with [you]" "$out" "[you]"
+"$S" send --me A --id "$IDL" --msg t3 >/dev/null
+out="$("$S" tail --id "$IDL" -n 1 2>/dev/null)"
+has "tail -n 1 shows newest" "$out" "t3"
+no  "tail -n 1 drops older" "$out" "t1"
+st="$("$S" status --id "$IDL")"; has "tail advanced no watermark" "$st" "behind"
+
 echo "== stop guard =="
 mkfake() { local f="$WORK/transcript.jsonl"; printf '{"role":"x","text":"ran %s --me %s --id ..."}\n' "$S" "$1" > "$f"; echo "$f"; }
 hookin() { printf '{"transcript_path":"%s","stop_hook_active":false}' "$1"; }

@@ -51,12 +51,31 @@ listening" become one action, so there's no re-arm step to forget. It blocks
 (backgrounded) until the other side writes, prints their message(s), and exits,
 which re-invokes you. Then check the exit code:
 
-- **`0`** — new message(s) printed; act on them, then reply again with `send … --watch`.
+- **`0`** — new message(s) shown; act on them, then reply again with `send … --watch`
+  (your reply is what acks them — see below). If the printed body looks truncated
+  or empty, run `read` to re-fetch before trusting it.
 - **`10`** — no activity for 1 hour. The watcher waited the whole hour itself (you
   did NOT re-arm during it) and fired a desktop alert. **Alert the user** (surface
   it / call `PushNotification`) and **ask before re-arming** — don't silently
   continue; the other session may be done or away.
 - **`20`** — the other side closed the channel; stop, the conversation is over.
+- **any other code (e.g. `143`/`144`), or you're re-invoked and a backgrounded
+  watcher is just gone** — the harness SIGTERMed it at a turn boundary. It may have
+  died holding an unshown message. **Run `read` (then `tail` if still unsure)
+  before concluding "nothing new"** — this is the recovery step that prevents a
+  swallowed message. It's safe: the watcher is a doorbell that never advanced the
+  watermark, so `read`/`tail` still has the message.
+
+### Delivery vs. ack — why you sometimes must `read`
+
+The backgrounded watcher is only a **doorbell**: it *shows* you incoming messages
+(a `--peek`) but deliberately does **not** advance your watermark, because a
+watcher can be killed after acking but before its output reaches you — that's how
+a message gets silently swallowed. The watermark (your durable "I've seen it")
+advances only when **you `send` a reply** (which acks everything inbound) or when
+you run a **foreground `read`**. So: after any watcher wakeup, either reply with
+`send … --watch`, or run `read` — don't leave a message shown-but-unacked, or the
+next re-arm will surface it again.
 
 Variants:
 - Multiline: `printf 'a\nb\n' | "$INTERCOM" send --me backend --id "$ID" - --watch`
@@ -66,11 +85,16 @@ Variants:
 ## Other commands
 
 ```bash
+"$INTERCOM" tail   --id "$ID" [-n 20] [--me backend]             # raw last-N view; touches NO watermark — the swallow-proof source of truth
 "$INTERCOM" close  --me backend --id "$ID"                        # end; other watcher exits 20
 "$INTERCOM" list  [--me backend]                                  # channels + participants (+unread with --me)
 "$INTERCOM" status --id "$ID"                                     # read-receipts: per-participant read position
 "$INTERCOM" send  --me backend --id "$ID" --json '{"schema":"v2"}'  # validated typed payload
 ```
+
+- **`tail`** prints straight from the append-only file — every message, from
+  anyone, regardless of watermarks. `read`/`watch` can never hide a message from
+  it, so it's your recovery tool: run it whenever you suspect a wake was lost.
 
 - **Read-receipts** (`status`, plus the `recipients read: …` line every `send`
   prints) confirm the other side *saw* a message without an ack turn — they write
@@ -95,6 +119,17 @@ Variants:
 
 ## Gotchas
 
+- **One watcher, never stacked.** Keep exactly one watcher armed per channel. Don't
+  fire a fresh `watch`/`send … --watch` while a previous one may still be alive —
+  parallel watchers race and multiply lost-wake windows. Re-arm only after the
+  prior watcher has exited (you were re-invoked).
+- **After any watcher death, recover before trusting silence.** If you're
+  re-invoked and the watcher is gone or exited non-0/10/20, run `read` (then `tail`)
+  before saying "nothing new" — a SIGTERMed doorbell may have died holding a message.
+- **Long async waits:** don't lean on one hour-long blocking `watch` for something
+  that may take a while (a deploy, a slow task). It's fragile across turn
+  boundaries. Prefer `ScheduleWakeup` to re-invoke yourself on a cadence you
+  control and `tail` the channel each time — a self-poll you own beats a long block.
 - **Stop guard:** you may be blocked from ending a turn if you leave a channel
   open with no watcher armed — re-arm (`send … --watch` / `watch`) or `close` it, then stop.
 - Override the 1h idle cap with `INTERCOM_WATCH_MAX_SECS`; the comms dir with
