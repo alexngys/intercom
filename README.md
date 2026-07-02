@@ -35,8 +35,6 @@ talk to each other directly and keep working while they wait.
   session and waits for "done" before reviewing.
 - **Long-running coordination** — a session kicks off a migration/deploy and
   pings another when it's safe to proceed.
-- **Two machines / two people** — point both sides at a shared folder and the
-  same back-and-forth works across hosts.
 
 ---
 
