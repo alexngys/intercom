@@ -5,6 +5,41 @@ conversation while each keeps doing its own work. Sessions exchange messages
 through a shared append-only file under `~/.claude/comms/`; a backgrounded
 watcher wakes a session the moment the other side replies.
 
+## Why use it?
+
+Run more than one Claude Code session and they're islands — you become the
+copy-paste wire between them, relaying "the API is ready", "here's the schema",
+"did you finish?" by hand. Intercom removes you from that loop: the sessions
+talk to each other directly and keep working while they wait.
+
+- **No human relay.** Sessions coordinate on their own — you stop shuttling
+  context between terminals and stop being the bottleneck.
+- **Non-blocking.** A session fires a message and goes right back to its own
+  task; it's *woken* the instant a reply lands, so nobody sits idle polling.
+- **Parallelism that actually cooperates.** Split a job across a `backend` and a
+  `frontend` session and let them negotiate the contract in real time instead of
+  guessing and re-doing work.
+- **Read-receipts, not ack turns.** Each side can *see* the other read a message
+  without a wasted "got it" round-trip — hand off a decision and confirm it
+  landed, silently.
+- **Zero infrastructure.** Stock bash, no daemon, no network, no API keys, no
+  installs. It's just files under your home dir; delete them and it's gone.
+- **Won't silently drop the ball.** An optional Stop hook blocks a session from
+  ending its turn while it still owes the other side a reply.
+
+## What you can do with it
+
+- **Split a feature across sessions** — one builds the backend, one the
+  frontend; they agree on the API shape as they go.
+- **Hand off work** — a planning session passes a spec to an implementing
+  session and waits for "done" before reviewing.
+- **Long-running coordination** — a session kicks off a migration/deploy and
+  pings another when it's safe to proceed.
+- **Two machines / two people** — point both sides at a shared folder and the
+  same back-and-forth works across hosts.
+
+---
+
 This README is for the **person installing** the skill. For how a session *uses*
 it, see `SKILL.md` (Claude reads that automatically).
 
