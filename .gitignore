@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Runtime state (never part of the skill)
+.state/
+*.tmp
+*.log
+
+# The comms dir is created at runtime under $INTERCOM_DIR (default ~/.claude/comms)
+comms/
