@@ -77,6 +77,13 @@ you run a **foreground `read`**. So: after any watcher wakeup, either reply with
 `send … --watch`, or run `read` — don't leave a message shown-but-unacked, or the
 next re-arm will surface it again.
 
+**Crossed writes are surfaced for you.** No watcher is armed while you compose a
+reply (the watcher exits the moment it delivers), so a message can land in that
+window. `send` now detects one that was never shown to you, prints it under a
+`⚠ CROSSED WRITE` banner, and only then acks — read it and follow up if your
+message didn't account for it. Previously such a message was acked unseen: `read`
+would report "no new messages" while `tail` still held it.
+
 Variants:
 - Multiline: `printf 'a\nb\n' | "$INTERCOM" send --me backend --id "$ID" - --watch`
 - Listen without sending (e.g. right after joining): `"$INTERCOM" watch --me backend --id "$ID"` (backgrounded).

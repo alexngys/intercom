@@ -8,3 +8,9 @@
 
 # The comms dir is created at runtime under $INTERCOM_DIR (default ~/.claude/comms)
 comms/
+.locks/
+
+# Channel logs, by name — belt and braces for the case where $INTERCOM_DIR is
+# pointed at the repo root itself rather than a comms/ subdir. Channel files are
+# <id>__<lastmod>.txt and carry raw conversation content.
+*__20*Z.txt
