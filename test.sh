@@ -150,6 +150,72 @@ printf '{"role":"x","text":"nothing here"}\n' > "$WORK/empty.jsonl"
 out="$(printf '{"transcript_path":"%s/empty.jsonl","stop_hook_active":false}' "$WORK" | "$GUARD")"
 eq "guard allows non-intercom session" "${out:-EMPTY}" "EMPTY"
 
+echo "== crossed write: a send must not ack a message it never showed me =="
+# B writes while A is composing (no watcher armed — the watcher exits on delivery,
+# so this is the whole time A is thinking). A then sends without having read.
+IDX="$(newid A crossed)"
+"$S" send --me B --id "$IDX" --msg "B-CROSSED" >/dev/null
+out="$("$S" send --me A --id "$IDX" --msg "A-blind-reply")"
+has "send warns about the crossed write" "$out" "CROSSED WRITE"
+has "send shows the swallowed message body" "$out" "B-CROSSED"
+# ...and having shown it in captured foreground output, the ack is then legitimate.
+out="$("$S" read --me A --id "$IDX" 2>/dev/null)"; has "acked after being shown" "$out" "no new messages"
+
+# A message the watcher already peeked must NOT be re-printed by the next send.
+IDY="$(newid A nonoise)"
+"$S" send --me B --id "$IDY" --msg "B-seen" >/dev/null
+"$S" read --me A --id "$IDY" --peek >/dev/null          # doorbell delivered it
+out="$("$S" send --me A --id "$IDY" --msg "A-reply")"
+no "no crossed-write noise for an already-delivered msg" "$out" "CROSSED WRITE"
+
+echo "== unread inbound already on disk at attach, with no later write =="
+# How this arises in the wild: the other side's message lands in the SAME SECOND
+# as my own send. touch_stamp renames to <id>__<now>.txt at 1s granularity and
+# skips the rename when the name is unchanged, so the filename is byte-identical
+# and a watcher gating on it sees "nothing changed" — then nothing else is ever
+# written (it's my turn to be replied to), so the gate never lifts and the
+# watcher sits out its entire idle budget on top of a message already on disk.
+# Asserted deterministically here as "unread inbound present, no write after
+# attach" — same state, no dependence on wall-clock luck.
+IDS="$(newid A samesec)"
+"$S" send --me B --id "$IDS" --msg first >/dev/null
+"$S" read --me A --id "$IDS" >/dev/null 2>&1          # watermark = 1
+"$S" send --me B --id "$IDS" --msg samesecmsg >/dev/null   # seq 2, unread
+out="$("${POLL[@]}" "$S" watch --me A --id "$IDS" 2>/dev/null)"; rc=$?
+eq "watch fires on inbound already present at attach" "$rc" "0"
+has "watch delivered it" "$out" "samesecmsg"
+
+echo "== watcher must not go blind when my own message is last =="
+# Inbound arrives, then I write. `last_author` is now me, but their message is
+# still unread — gating on the last author would sit out the whole idle budget.
+IDL="$(newid A lastauthor)"
+"$S" send --me B --id "$IDL" --msg "B-earlier" >/dev/null
+"$S" read --me A --id "$IDL" --peek >/dev/null     # delivered, deliberately not acked
+"$S" send --me A --id "$IDL" --msg "A-later" >/dev/null 2>&1
+"$S" read --me A --id "$IDL" --peek >/dev/null
+printf '2\n' > "$INTERCOM_DIR/.state/A/$IDL"       # simulate: acked #1 only, #2 is mine
+"$S" send --me B --id "$IDL" --msg "B-newest" >/dev/null
+out="$("${POLL[@]}" "$S" watch --me A --id "$IDL" 2>/dev/null)"; rc=$?
+eq "watch fires on inbound above watermark" "$rc" "0"
+has "watch delivered it" "$out" "B-newest"
+
+echo "== event mode: a failing event tool must not silently kill the watcher =="
+# Under `set -e`, `wait_for_change ...; rc=$?` exits the shell before rc is ever
+# assigned: every event-mode timeout died with a bare 1, no idle alert at all.
+FAKE="$WORK/fakebin"; mkdir -p "$FAKE"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE/fswatch"; chmod +x "$FAKE/fswatch"
+IDE="$(newid A eventmode)"
+# Redirect to a FILE, not a pipe: an orphaned timer child inherits the pipe and
+# blocks the capture for the whole timeout, which would hide the very leak we are
+# asserting on (and makes a dead watcher look alive to its caller).
+rc=0; env INTERCOM_WATCH_MAX_SECS=3 PATH="$FAKE:/usr/bin:/bin" \
+  "$S" watch --me A --id "$IDE" > "$WORK/ev.out" 2>&1 || rc=$?
+out="$(cat "$WORK/ev.out")"
+leaked="$(ps -Ao args= 2>/dev/null | grep -c '[s]leep 3$' || true)"
+eq "no orphaned timer child left behind" "$leaked" "0"
+eq "failing event tool does not exit a bare 1" "$rc" "10"
+has "degrades to polling instead of dying" "$out" "TIMEOUT"
+
 echo
 echo "==== $PASS passed, $FAIL failed ===="
 (( FAIL == 0 ))
