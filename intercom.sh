@@ -176,6 +176,38 @@ set_watermark() {
   printf '%s\n' "$seq" > "$wf"
 }
 
+# Delivery marker: the highest seq a `--peek` has PRINTED. Distinct from the
+# watermark (the durable "I've seen it" ACK) — a peek delivers without acking, so
+# on its own the watermark cannot tell "the watcher showed me this but I haven't
+# acked it" from "this arrived and nobody has ever seen it". `send` needs exactly
+# that distinction to know whether its ack would swallow something (see cmd_send).
+# Residual window, much narrower than the bug it fixes: if a peek is SIGTERMed
+# between printing and this write, delivery is recorded for output that was lost.
+# The watermark still hasn't moved in that case, so `read`/`tail` re-delivers.
+delivered_file() { printf '%s\n' "$STATE_DIR/$1/$2.peek"; }
+
+get_delivered() {
+  local df; df="$(delivered_file "$1" "$2")"
+  [[ -f "$df" ]] && cat "$df" || echo 0
+}
+
+set_delivered() {
+  local df; df="$(delivered_file "$1" "$2")"
+  mkdir -p "$(dirname "$df")"
+  printf '%s\n' "$3" > "$df"
+}
+
+# Highest seq NOT from $2 — the newest INBOUND message. The watcher used to gate
+# on the last message's author instead, which goes blind whenever my own message
+# is last (exactly the crossed-write case) even though older inbound messages sit
+# unread above my watermark.
+max_inbound_seq() {
+  local path="$1" me="$2"
+  grep -E '^===== MSG [0-9]+ \| from:' "$path" 2>/dev/null \
+    | grep -vF "| from:$me |" \
+    | grep -Eo '^===== MSG [0-9]+' | grep -Eo '[0-9]+' | sort -n | tail -1 || true
+}
+
 # Rename a channel file so its __<lastmod> suffix reflects "now".
 touch_stamp() {
   local path="$1" id="$2"
@@ -286,6 +318,27 @@ cmd_send() {
   acquire_lock "$ID"
   local path; path="$(require_channel "$ID")"
 
+  # CROSSED WRITE. A message can land between my last read and this send — most
+  # often while I'm composing this very reply, when no watcher is armed (the
+  # watcher exits the moment it delivers). The ack at the bottom of this function
+  # sets my watermark to MY seq, which is always the highest in the file, so an
+  # inbound message nobody has shown me gets marked read having never been seen:
+  # `read` then reports "no new messages" while `tail` still holds it. Silent and
+  # permanent. This is the last instant we can still catch it, so surface it here
+  # — in the send's own foreground output, which the harness captures reliably —
+  # and only then let the ack proceed.
+  local pre_wm pre_del pre_shown pre_inbound
+  pre_wm="$(get_watermark "$ME" "$ID")"
+  pre_del="$(get_delivered "$ME" "$ID")"
+  pre_shown=$(( pre_wm > pre_del ? pre_wm : pre_del ))
+  pre_inbound="$(max_inbound_seq "$path" "$ME")"; pre_inbound="${pre_inbound:-0}"
+  if (( pre_inbound > pre_shown )); then
+    echo "[intercom] ⚠ CROSSED WRITE on $ID — inbound message(s) you have never been shown:"
+    cmd_read --me "$ME" --id "$ID" --peek
+    echo "[intercom] ↑ the above crossed with the message you are sending. Your send acks them,"
+    echo "[intercom] so read them now and follow up if your message did not take them into account."
+  fi
+
   local seq; seq=$(( $(max_seq "$path") + 1 ))
   local ts; ts="$(now_utc)"
   {
@@ -351,7 +404,11 @@ cmd_read() {
     { if (printing) print }
   ' "$path"
 
-  (( PEEK )) || set_watermark "$ME" "$ID" "$top"
+  if (( PEEK )); then
+    set_delivered "$ME" "$ID" "$top"      # shown, deliberately NOT acked
+  else
+    set_watermark "$ME" "$ID" "$top"      # foreground read: output is reliably captured, so ack
+  fi
 }
 
 # Raw recovery view: print the last -n messages (default 20) straight from the
@@ -400,11 +457,17 @@ wait_for_change() {
   local timeout="$1"
   (( timeout > 0 )) || return 1
   if command -v fswatch >/dev/null 2>&1; then
-    local wpid tpid
+    local wpid tpid rc=0
     fswatch -1 "$COMMS_DIR" >/dev/null 2>&1 & wpid=$!
     ( sleep "$timeout"; kill "$wpid" 2>/dev/null ) & tpid=$!
-    if wait "$wpid" 2>/dev/null; then kill "$tpid" 2>/dev/null; return 0; fi
-    return 1
+    wait "$wpid" 2>/dev/null || rc=1
+    # Always reap the timer child, on EVERY path. Orphaned, it inherits our
+    # stdout and holds a backgrounded watcher's pipe open for the whole timeout
+    # after this process is gone — the caller sees a watcher that looks alive for
+    # an hour after it died, and we leak one `sleep` per failed iteration.
+    kill "$tpid" 2>/dev/null || true
+    wait "$tpid" 2>/dev/null || true
+    return $rc
   elif command -v inotifywait >/dev/null 2>&1; then
     inotifywait -q -t "$timeout" -e create,moved_to,modify,close_write \
       "$COMMS_DIR" >/dev/null 2>&1 && return 0 || return 1
@@ -416,16 +479,20 @@ wait_for_change() {
 # actionable (new inbound messages or a close). $SEEN_STAMP persists the last
 # filename stamp we observed so our own writes / noise don't re-trigger.
 _watch_check() {
-  local path cur_stamp author wm top
+  local path cur_stamp wm
   path="$(channel_path "$ID")"
   [[ -n "$path" ]] || die "channel '$ID' disappeared"
+  # Deliberately NO early-return on an unchanged filename stamp. The __<lastmod>
+  # suffix has 1-second granularity and touch_stamp skips the rename when the new
+  # name equals the old one, so two writes in the same second leave the filename
+  # byte-identical — a stamp gate then goes blind until some LATER write happens
+  # to bump it, which on a "your turn now" pause is never, and the watcher sits
+  # out its whole idle budget with a message already on disk. Re-derive the real
+  # state from the file instead; three greps every couple of seconds is nothing.
   cur_stamp="$(basename "$path")"
-  [[ "$cur_stamp" == "$SEEN_STAMP" ]] && return 0
   SEEN_STAMP="$cur_stamp"
 
-  author="$(last_author "$path")"
   wm="$(get_watermark "$ME" "$ID")"
-  top="$(max_seq "$path")"; top="${top:-0}"
 
   # Stop the moment the channel is closed — by anyone. (Keyed off `closed-by:`,
   # not the last message author, so a close still fires even when I sent last.)
@@ -434,7 +501,8 @@ _watch_check() {
     echo "[intercom] channel $ID closed by ${closer:-?}"
     exit $EX_CLOSED
   fi
-  if (( top > wm )) && [[ "$author" != "$ME" ]]; then
+  local inbound; inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
+  if (( inbound > wm )); then
     echo "[intercom] new on $ID:"       # per-message "from#seq:" carries the rest
     cmd_read --me "$ME" --id "$ID" --peek   # doorbell: deliver, but DON'T advance
     echo "[intercom] (shown via watcher; watermark unchanged — your reply's \`send\` acks it, or run \`read\`/\`tail\` if this output was truncated)"
@@ -469,8 +537,19 @@ cmd_watch() {
   SECONDS=0
   while true; do
     if [[ "$mode" == "event" ]]; then
-      wait_for_change "$(( WATCH_MAX_SECS - SECONDS ))"; rc=$?
+      # `rc=$?` on its own line would be too late: under `set -e` a non-zero
+      # return from a bare simple command kills the shell before the assignment
+      # ever runs. That made every event-mode timeout (and any fswatch hiccup)
+      # exit 1 SILENTLY — no idle alert, no EX_TIMEOUT, and the rc==2
+      # degrade-to-polling branch below was unreachable dead code.
+      rc=0; wait_for_change "$(( WATCH_MAX_SECS - SECONDS ))" || rc=$?
       if (( rc == 2 )); then mode="poll"; continue; fi   # tool vanished; degrade
+      # A working event tool returns non-zero only when OUR timer killed it, i.e.
+      # the budget is spent. Non-zero while time is left means the tool itself
+      # failed (couldn't start, hit a descriptor limit, watched dir replaced) —
+      # that is not an idle conversation, so don't fire the "nobody replied for
+      # an hour" alert. Fall back to polling and keep the channel alive.
+      if (( rc == 1 && SECONDS < WATCH_MAX_SECS )); then mode="poll"; continue; fi
       _watch_check
       if (( SECONDS >= WATCH_MAX_SECS )); then rc=1; fi
     else
