@@ -58,7 +58,12 @@ which re-invokes you. Then check the exit code:
   did NOT re-arm during it) and fired a desktop alert. **Alert the user** (surface
   it / call `PushNotification`) and **ask before re-arming** — don't silently
   continue; the other session may be done or away.
-- **`20`** — the other side closed the channel; stop, the conversation is over.
+- **`21`** — the other side **half-closed**: they're done sending but still
+  receiving. Not a stop. Send anything still outstanding, then `close` your own
+  side. Reported once per FIN, so a re-armed watcher won't spin on it.
+- **`20`** — the channel is **fully closed** (everyone half-closed, or someone
+  used `--force`). Stop. **Read the output first**: exit 20 now carries any final
+  message that arrived with the close.
 - **any other code (e.g. `143`/`144`), or you're re-invoked and a backgrounded
   watcher is just gone** — the harness SIGTERMed it at a turn boundary. It may have
   died holding an unshown message. **Run `read` (then `tail` if still unsure)
@@ -93,11 +98,33 @@ Variants:
 
 ```bash
 "$INTERCOM" tail   --id "$ID" [-n 20] [--me backend]             # raw last-N view; touches NO watermark — the swallow-proof source of truth
-"$INTERCOM" close  --me backend --id "$ID"                        # end; other watcher exits 20
-"$INTERCOM" list  [--me backend]                                  # channels + participants (+unread with --me)
-"$INTERCOM" status --id "$ID"                                     # read-receipts: per-participant read position
+"$INTERCOM" close  --me backend --id "$ID"                        # HALF-close: I'm done sending, still receiving (peer's watcher exits 21)
+"$INTERCOM" close  --me backend --id "$ID" --force                # hard close both sides — only for a peer that is gone
+"$INTERCOM" list  [--me backend]                                  # channels + participants (+unread with --me); marks [half]
+"$INTERCOM" status --id "$ID"                                     # read-receipts, who's [done sending], watcher-armed warning
 "$INTERCOM" send  --me backend --id "$ID" --json '{"schema":"v2"}'  # validated typed payload
 ```
+
+## Closing: half-close, not a kill switch
+
+`close` means **"I am done sending"** — a FIN. You keep receiving; the other side
+keeps talking if it needs to. The channel goes fully closed only once **every**
+participant has closed their side.
+
+```
+  you: close        →  closing-by: you        (their watcher exits 21)
+       ├── they still need you  →  they keep sending; your watcher wakes as normal
+       └── they're done too     →  they close  →  CHANNEL CLOSED, both exit 20
+```
+
+- **Never `--force` a live peer.** It hard-closes both sides mid-conversation.
+  It exists for a peer that is genuinely gone (reaped, session ended) — a strictly
+  mutual close would hang forever exactly then.
+- **`send` on a fully closed channel fails** (exit 1) instead of appending bytes
+  nobody will ever read. Open a new channel instead.
+- **Sending after your own half-close reopens your side** automatically — a FIN is
+  a statement of intent, not a lock.
+- `close` prints any inbound you were never shown before it writes your FIN.
 
 - **`tail`** prints straight from the append-only file — every message, from
   anyone, regardless of watermarks. `read`/`watch` can never hide a message from
@@ -107,6 +134,10 @@ Variants:
   prints) confirm the other side *saw* a message without an ack turn — they write
   nothing and wake nobody. Retire the handshake: send "LOCKED; object only if you
   disagree", then confirm via `status`. A read *is* the ack.
+- **`⚠ no live watcher` after a `send`** means the peer has no watcher armed on
+  this machine, so **your message will not wake them**. It's safe on disk, but
+  that session is deaf until someone pokes it. Surface this to the user — don't
+  sit waiting for a reply that cannot come.
 - **`--json`** validates (rejects malformed) and tags `type:json`, so both sides
   share canonical bytes — no paraphrasing drift. Composes with `--watch`.
 - **`list` participants** = opener + senders + anyone watching/reading, so it
@@ -123,6 +154,20 @@ Variants:
   future messages surface). Pull history with `read` first.
 - **Event-driven** via fswatch/inotifywait when present (one write wakes all
   watchers), else a 2s poll. Writes are serialized by a `mkdir` mutex.
+- **Close** is two-phase: `closing-by:` per side (retractable by a later
+  `reopen-by:`), and `--- CHANNEL CLOSED ---` + `closed-by:` only once all sides
+  have FIN'd or someone forced it.
+- **Sentinel.** Your `watch` is a background child of Claude Code, and the harness
+  reaps it — measured across real sessions: 119 of 131 watcher deaths were
+  external kills, median 29 minutes into a 60-minute budget. The reap lands
+  *during the idle stretch after your turn ends*, i.e. after the Stop guard
+  already ran, so nothing inside the session can notice and no further Stop
+  fires. Every `watch` therefore also spawns a **sentinel**: a double-forked,
+  setsid'd process outside the session that survives the reap. It can't wake you
+  (only a completing background task does that), so when a message sits unread
+  with no watcher armed it fires a **desktop notification at the human**. It is a
+  pure observer — never acks, never writes to the channel. `INTERCOM_NO_SENTINEL=1`
+  disables it.
 
 ## Gotchas
 
@@ -139,5 +184,9 @@ Variants:
   control and `tail` the channel each time — a self-poll you own beats a long block.
 - **Stop guard:** you may be blocked from ending a turn if you leave a channel
   open with no watcher armed — re-arm (`send … --watch` / `watch`) or `close` it, then stop.
+- **Don't `close --force` to tidy up.** Half-closing (plain `close`) says you're
+  done without cutting the other side off; forcing is for a peer that is gone.
 - Override the 1h idle cap with `INTERCOM_WATCH_MAX_SECS`; the comms dir with
-  `INTERCOM_DIR` (both sides must agree).
+  `INTERCOM_DIR` (both sides must agree). `INTERCOM_NO_SENTINEL=1` skips the
+  sentinel; `INTERCOM_NO_PS=1` silences the watcher-liveness warnings (set it when
+  the two sides are on different machines, where a process check can't see them).
