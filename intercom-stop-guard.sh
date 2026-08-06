@@ -63,9 +63,16 @@ for wf in "$STATE_DIR/$me"/*; do
   # you're not mid-conversation — don't nag (and don't false-block a session that
   # merely reused an old label).
   [[ -n "$(find "${files[0]}" -mmin "-${GUARD_STALE_MIN:-60}" 2>/dev/null)" ]] || continue
-  # A live watcher = an intercom.sh process for this id running `watch`/`--watch`.
+  # Arm the out-of-session sentinel for every live channel, whatever we decide
+  # about the stop. This hook is the LAST thing that runs before the idle window
+  # in which the harness reaps the in-session watcher — after that no Stop fires
+  # again, so this is the final chance to leave something behind that can still
+  # reach the human. Idempotent (pidfile-guarded) and returns immediately.
+  "$INTERCOM" sentinel --me "$me" --id "$id" --spawn >/dev/null 2>&1 || true
+  # A live watcher = an intercom.sh process for this id running `watch`/`--watch`
+  # (the sentinel also carries the id, so exclude it — it is not a watcher).
   if ps -Ao args= 2>/dev/null | grep -F 'intercom.sh' \
-       | grep -F -- "$id" | grep -Eq 'watch'; then
+       | grep -F -- "$id" | grep -vF 'sentinel' | grep -Eq 'watch'; then
     continue
   fi
   unguarded_id="$id"; break
