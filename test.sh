@@ -75,10 +75,68 @@ IDW="$(newid A)"
 ( sleep 1; "$S" send --me B --id "$IDW" --msg ping >/dev/null 2>&1 ) &
 "${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me A --id "$IDW" >/dev/null 2>&1; eq "watch new-msg" "$?" "0"
 
-echo "== watch: close path -> exit 20 (even when I sent last) =="
+echo "== watch: peer half-close -> exit 21 (not a hard stop) =="
 "$S" send --me A --id "$IDW" --msg last >/dev/null
 ( sleep 1; "$S" close --me B --id "$IDW" >/dev/null 2>&1 ) &
-"${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me A --id "$IDW" >/dev/null 2>&1; eq "watch close" "$?" "20"
+out="$("${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me A --id "$IDW" 2>&1)"; rc=$?
+eq "watch peer-fin" "$rc" "21"
+has "fin names the peer" "$out" "half-closed"
+# and once reported, a re-armed watcher must NOT spin on the same FIN
+out="$("${POLL[@]}" INTERCOM_WATCH_MAX_SECS=3 "$S" watch --me A --id "$IDW" 2>&1)"; rc=$?
+eq "same FIN not re-reported" "$rc" "10"
+
+echo "== close: mutual FIN closes the channel; watch then exits 20 =="
+"$S" close --me A --id "$IDW" >/dev/null 2>&1
+out="$("$S" tail --id "$IDW" -n 1 2>&1)"; has "channel now CLOSED" "$out" "CLOSED by A"
+out="$("${POLL[@]}" INTERCOM_WATCH_MAX_SECS=5 "$S" watch --me B --id "$IDW" 2>&1)"; rc=$?
+eq "watch closed" "$rc" "20"
+
+echo "== half-close is not a hard close: peer can still send, closer still receives =="
+IDH="$(newid A)"
+"$S" send --me A --id "$IDH" --msg hi >/dev/null
+"$S" read --me B --id "$IDH" >/dev/null 2>&1
+out="$("$S" close --me A --id "$IDH" 2>&1)"
+has "close reports half-closed" "$out" "half-closed"
+has "close names who it waits on" "$out" "waiting on: B"
+no "half-close did not hard close" "$(cat "$WORK/$IDH"__*.txt)" "--- CHANNEL CLOSED ---"
+out="$("$S" send --me B --id "$IDH" --msg "still here" 2>&1)"; rc=$?
+eq "peer can still send after my FIN" "$rc" "0"
+has "peer warned about my FIN" "$out" "done sending"
+out="$("$S" read --me A --id "$IDH" 2>&1)"; has "half-closer still receives" "$out" "still here"
+out="$("$S" send --me A --id "$IDH" --msg "actually one more" 2>&1)"
+has "sending reopens my half" "$out" "reopens it"
+no "my FIN was retracted" "$("$S" close --me B --id "$IDH" 2>&1)" "all participants half-closed"
+
+echo "== close --force ends it even with a live peer =="
+IDF="$(newid A)"
+"$S" send --me A --id "$IDF" --msg x >/dev/null; "$S" read --me B --id "$IDF" >/dev/null 2>&1
+out="$("$S" close --me A --id "$IDF" --force 2>&1)"
+has "force closes" "$out" "force-closed"
+has "records who was cut off" "$(cat "$WORK/$IDF"__*.txt)" "close-mode: forced"
+
+echo "== send into a closed channel must fail, not append into the void =="
+out="$("$S" send --me B --id "$IDF" --msg "hello?" 2>&1)"; rc=$?
+eq "send on closed exits non-zero" "$rc" "1"
+has "send explains the close" "$out" "is CLOSED"
+eq "nothing was appended" "$(grep -c '^===== MSG ' "$WORK/$IDF"__*.txt)" "1"
+
+echo "== close must not strand the last message (42/63 channels did) =="
+IDD="$(newid A)"
+"$S" send --me A --id "$IDD" --msg first >/dev/null
+"$S" read --me B --id "$IDD" >/dev/null 2>&1        # B is caught up, then goes away
+# Both the message AND the close are on disk before B's watcher looks — the exact
+# interleaving that used to lose the message (closer check ran first, exit 20).
+"$S" send --me A --id "$IDD" --msg "FINAL WORD" >/dev/null 2>&1
+"$S" close --me A --id "$IDD" --force >/dev/null 2>&1
+out="$("${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me B --id "$IDD" 2>&1)"; rc=$?
+has "final message was delivered, not swallowed" "$out" "FINAL WORD"
+has "close reported in the same output" "$out" "CLOSED"
+eq "still exits 20" "$rc" "20"
+
+echo "== double close is a no-op =="
+out="$("$S" close --me A --id "$IDF" 2>&1)"; eq "second close exits 0" "$?" "0"
+has "second close says so" "$out" "already fully closed"
+eq "only one close marker" "$(grep -c '^--- CHANNEL CLOSED ---' "$WORK/$IDF"__*.txt)" "1"
 
 echo "== watch: idle timeout -> exit 10 + directive =="
 IDT="$(newid A)"
@@ -215,6 +273,72 @@ leaked="$(ps -Ao args= 2>/dev/null | grep -c '[s]leep 3$' || true)"
 eq "no orphaned timer child left behind" "$leaked" "0"
 eq "failing event tool does not exit a bare 1" "$rc" "10"
 has "degrades to polling instead of dying" "$out" "TIMEOUT"
+
+echo "== send warns when nobody is armed to receive it =="
+IDN="$(newid A)"
+"$S" send --me A --id "$IDN" --msg one >/dev/null
+"$S" read --me B --id "$IDN" >/dev/null 2>&1        # B is now a participant, not watching
+out="$(INTERCOM_NO_SENTINEL=1 "$S" send --me A --id "$IDN" --msg two 2>&1)"
+has "send flags the deaf peer" "$out" "no live watcher"
+has "send names who won't wake" "$out" "B"
+# ...and stays quiet when a watcher IS armed. B must be caught up first, or the
+# watcher delivers the backlog and exits before the next send ever looks for it.
+"$S" read --me B --id "$IDN" >/dev/null 2>&1
+( env INTERCOM_POLL_SECS=1 INTERCOM_WATCH_MAX_SECS=8 INTERCOM_NO_SENTINEL=1 PATH=/usr/bin:/bin \
+    "$S" watch --me B --id "$IDN" >/dev/null 2>&1 ) &
+WPID=$!; sleep 1
+out="$(INTERCOM_NO_SENTINEL=1 "$S" send --me A --id "$IDN" --msg three 2>&1)"
+no "no false alarm while a watcher lives" "$out" "no live watcher"
+wait $WPID 2>/dev/null || true
+
+echo "== sentinel: detaches, survives its spawner, notifies, stays a pure observer =="
+IDS="$(newid A sentinel)"
+"$S" read --me B --id "$IDS" >/dev/null 2>&1
+# Spawn from a subshell that exits immediately: if the sentinel were a plain
+# child it would die with it. That is the entire point of the double-fork.
+( INTERCOM_SENTINEL_POLL_SECS=1 INTERCOM_SENTINEL_GRACE_SECS=1 \
+  "$S" sentinel --me B --id "$IDS" --spawn >/dev/null 2>&1 ) &
+wait $! 2>/dev/null || true
+sleep 2
+PF="$WORK/.state/B/$IDS.sentinel.pid"
+if [[ -f "$PF" ]] && kill -0 "$(cat "$PF")" 2>/dev/null; then ok "sentinel outlived its spawner"
+else bad "sentinel outlived its spawner (no live pid at $PF)"; fi
+SPID="$(cat "$PF" 2>/dev/null || echo 0)"
+# Detachment evidence: it sits in a different process group than us (setsid), and
+# it has been reparented to init (ppid 1) — so killing our tree cannot reach it.
+# (macOS `ps -o sess=` reports 0, hence pgid+ppid rather than a session compare.)
+SPGID="$(ps -o pgid= -p "$SPID" 2>/dev/null | tr -d ' ' || true)"
+OURPGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+SPPID="$(ps -o ppid= -p "$SPID" 2>/dev/null | tr -d ' ' || true)"
+if [[ "$SPID" != 0 && -n "$SPGID" && "$SPGID" != "$OURPGID" ]]; then
+  ok "sentinel left our process group"
+else bad "sentinel shares our process group (pgid=$SPGID ours=$OURPGID)"; fi
+eq "sentinel reparented to init" "$SPPID" "1"
+WM_BEFORE="$(cat "$WORK/.state/B/$IDS" 2>/dev/null || echo 0)"
+"$S" send --me A --id "$IDS" --msg "unread and unwatched" >/dev/null 2>&1
+sleep 6
+eq "sentinel never touched the watermark" "$(cat "$WORK/.state/B/$IDS" 2>/dev/null || echo 0)" "$WM_BEFORE"
+[[ -f "$WORK/.state/B/$IDS.peek" ]] && bad "sentinel wrote a delivery marker" || ok "sentinel wrote no delivery marker"
+has "sentinel logged the deaf channel" "$(cat "$WORK/.state/B/$IDS.sentinel.log" 2>/dev/null || true)" "no watcher armed"
+# A close must retire it rather than leave it running forever.
+"$S" close --me B --id "$IDS" --force >/dev/null 2>&1
+sleep 3
+if kill -0 "$SPID" 2>/dev/null; then bad "sentinel exits on close"; kill "$SPID" 2>/dev/null || true
+else ok "sentinel exits on close"; fi
+
+echo "== sentinel is single-instance =="
+ID2S="$(newid A)"
+"$S" sentinel --me A --id "$ID2S" --spawn >/dev/null 2>&1; sleep 1
+"$S" sentinel --me A --id "$ID2S" --spawn >/dev/null 2>&1; sleep 1
+n="$(ps -Ao args= 2>/dev/null | grep -F 'intercom.sh' | grep -F "$ID2S" | grep -cF 'sentinel' || true)"
+eq "exactly one sentinel per channel" "$n" "1"
+kill "$(cat "$WORK/.state/A/$ID2S.sentinel.pid" 2>/dev/null || echo 0)" 2>/dev/null || true
+
+# Leave no detached processes behind from this run.
+for pf in "$WORK"/.state/*/*.sentinel.pid; do
+  [[ -f "$pf" ]] || continue
+  kill "$(cat "$pf" 2>/dev/null || echo 0)" 2>/dev/null || true
+done
 
 echo
 echo "==== $PASS passed, $FAIL failed ===="

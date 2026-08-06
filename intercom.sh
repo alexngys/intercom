@@ -6,7 +6,7 @@
 # append-only file under ~/.claude/comms/. Each session keeps doing its own work
 # and is re-invoked (via a backgrounded `watch`) when the other side replies.
 #
-# Subcommands: open | send | read | watch | list | close
+# Subcommands: open | send | read | tail | watch | sentinel | status | list | close
 # See SKILL.md for usage from a Claude Code session.
 
 set -euo pipefail
@@ -24,7 +24,8 @@ WATCH_MAX_SECS="${INTERCOM_WATCH_MAX_SECS:-3600}" # 60 min idle, then exit 10 (a
 # Exit codes used by `watch` (SKILL.md depends on these):
 EX_NEW=0      # new messages from the other side were printed
 EX_TIMEOUT=10 # no activity for the full idle budget; caller should ALERT the user
-EX_CLOSED=20  # channel was closed by the other side; caller should stop
+EX_CLOSED=20  # channel is fully closed (every side FIN'd, or a --force close); stop
+EX_FIN=21     # the other side half-closed (done sending, still receiving); you may still send
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -105,10 +106,45 @@ last_author() {
     | tail -1 | sed -E 's/.*from:([^ ]+).*/\1/' || true
 }
 
-# Label that closed the channel (from the `closed-by:` line), or empty if open.
+# Label that FULLY closed the channel (`closed-by:`), or empty while it's open.
+# A full close means every participant has half-closed, or someone used --force.
 closed_by() {
   local path="$1"
   grep -m1 '^closed-by: ' "$path" 2>/dev/null | sed 's/^closed-by: //' || true
+}
+
+# Labels currently half-closed ("FIN": done sending, still receiving). The log is
+# append-only, so a retraction is a later `reopen-by:` line rather than an edit —
+# a side that half-closed and then sends again reopens its half automatically.
+fin_labels() {
+  local path="$1"
+  awk '
+    /^closing-by: / { l = $2; if (!(l in seen)) { seen[l] = 1; order[++n] = l }; state[l] = "fin" }
+    /^reopen-by: /  { l = $2; state[l] = "open" }
+    END { for (i = 1; i <= n; i++) if (state[order[i]] == "fin") print order[i] }
+  ' "$path" 2>/dev/null || true
+}
+
+has_fin() { fin_labels "$1" | grep -qxF "$2"; }
+
+# Everyone except me who has half-closed, comma-joined (empty if none).
+peer_fins() {
+  local path="$1" me="$2"
+  fin_labels "$path" | grep -vxF "$me" | paste -sd, - || true
+}
+
+# Is a `watch` alive for this channel on THIS machine (excluding my own process)?
+# Same probe the Stop guard uses. Cross-machine setups have no visibility into
+# the peer's process table — set INTERCOM_NO_PS=1 there to silence the warning.
+watcher_alive() {
+  local id="$1" pid args
+  [[ -n "${INTERCOM_NO_PS:-}" ]] && return 0
+  while read -r pid args; do
+    [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+    [[ "$args" == *intercom.sh* && "$args" == *"$id"* && "$args" != *sentinel* ]] || continue
+    [[ "$args" == *" watch "* || "$args" == *" watch" || "$args" == *--watch* ]] && return 0
+  done < <(ps -Ao pid=,args= 2>/dev/null)
+  return 1
 }
 
 # Distinct participant labels in a channel: the opener, every message sender, AND
@@ -197,6 +233,31 @@ set_delivered() {
   printf '%s\n' "$3" > "$df"
 }
 
+# Highest seq I've been shown by ANY route — the durable ack or a peek's
+# delivery. What "unread" means for the sentinel and for close's unread warning.
+shown_seq() {
+  local wm del
+  wm="$(get_watermark "$1" "$2")"; del="$(get_delivered "$1" "$2")"
+  (( wm > del )) && printf '%s\n' "$wm" || printf '%s\n' "$del"
+}
+
+# Which peer FINs I've already been told about, so a re-armed watcher doesn't
+# exit 21 on every poll for a half-close it already reported (that would spin the
+# session: wake, re-arm, wake, …). Suffixed files never collide with the bare
+# `<id>` watermark that `participants` globs for.
+fin_ackfile() { printf '%s\n' "$STATE_DIR/$1/$2.fin"; }
+
+# Sentinel bookkeeping. All suffixed, all outside the watermark namespace.
+sentinel_pidfile()  { printf '%s\n' "$STATE_DIR/$1/$2.sentinel.pid"; }
+sentinel_logfile()  { printf '%s\n' "$STATE_DIR/$1/$2.sentinel.log"; }
+
+sentinel_running() {
+  local pf pid; pf="$(sentinel_pidfile "$1" "$2")"
+  [[ -f "$pf" ]] || return 1
+  pid="$(cat "$pf" 2>/dev/null)"; [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
 # Highest seq NOT from $2 — the newest INBOUND message. The watcher used to gate
 # on the last message's author instead, which goes blind whenever my own message
 # is last (exactly the crossed-write case) even though older inbound messages sit
@@ -222,7 +283,7 @@ touch_stamp() {
 # Arg parsing (shared)
 # ----------------------------------------------------------------------------
 ME="" ; ID="" ; TOPIC="" ; MSG="" ; JSON="" ; READ_STDIN=0 ; WATCH_AFTER=0
-PEEK=0 ; TAIL_N=20
+PEEK=0 ; TAIL_N=20 ; FORCE=0 ; SPAWN=0
 parse_args() {
   while (( $# )); do
     case "$1" in
@@ -233,6 +294,8 @@ parse_args() {
       --json)  JSON="$2"; shift 2 ;;
       --watch) WATCH_AFTER=1; shift ;;
       --peek)  PEEK=1; shift ;;        # print without advancing the watermark
+      --force) FORCE=1; shift ;;       # close: hard-close both sides (dead peer)
+      --spawn) SPAWN=1; shift ;;       # sentinel: detach and return immediately
       -n)      TAIL_N="$2"; shift 2 ;; # tail: how many recent messages to show
       -)       READ_STDIN=1; shift ;;
       *)       die "unknown argument: $1" ;;
@@ -318,6 +381,22 @@ cmd_send() {
   acquire_lock "$ID"
   local path; path="$(require_channel "$ID")"
 
+  # A CLOSED channel is write-dead. `send` used to append happily past the close
+  # marker: the bytes landed on disk, the peer's watcher had already exited 20 and
+  # nobody was ever coming back to read them. Fail loudly instead of writing into
+  # a void — the caller can reopen a fresh channel.
+  local closer; closer="$(closed_by "$path")"
+  [[ -n "$closer" ]] && die "channel $ID is CLOSED (by $closer) — nothing sent. Messages appended after a close are never delivered; open a new channel."
+
+  # I half-closed earlier and I'm sending again: retract my FIN. Append-only, so
+  # the retraction is a new line rather than an edit.
+  if has_fin "$path" "$ME"; then
+    { echo "reopen-by: $ME"; echo "reopen-at: $(now_utc)"; echo; } >> "$path"
+    echo "[intercom] note — you had half-closed your side; sending reopens it."
+  fi
+  local pfins; pfins="$(peer_fins "$path" "$ME")"
+  [[ -n "$pfins" ]] && echo "[intercom] note — $pfins already said they're done sending (half-closed); they still receive this."
+
   # CROSSED WRITE. A message can land between my last read and this send — most
   # often while I'm composing this very reply, when no watcher is armed (the
   # watcher exits the moment it delivers). The ack at the bottom of this function
@@ -354,6 +433,23 @@ cmd_send() {
   release_lock "$ID"                   # done writing — don't hold the lock past here
   echo "sent MSG $seq on $ID"
   receipts_line "$path" "$ME" "$seq"   # who's read up to where (append-only-safe pull)
+
+  # PEER LIVENESS. The other side's watcher is a background child of THEIR Claude
+  # Code process, and the harness reaps it on idle — after their Stop hook has
+  # already run and passed, so nothing on their side can notice it died. A send
+  # into a channel with no armed watcher therefore vanishes silently. This is the
+  # last point where a human is still in the loop, so check here and escalate.
+  if ! watcher_alive "$ID"; then
+    local others; others="$(participants "$path" | grep -vxF "$ME" | paste -sd, - || true)"
+    if [[ -n "$others" ]]; then
+      echo "[intercom] ⚠ no live watcher for $ID on this machine — $others will NOT be woken by this message."
+      echo "[intercom]   Their watcher was most likely reaped. The message is safe on disk (\`read\`/\`tail\` still has it),"
+      echo "[intercom]   but that session needs a poke before it will see anything. Tell the user."
+      alert_user "intercom: nobody listening on $ID" "MSG $seq sent but no watcher is armed - $others will not wake."
+    else
+      echo "[intercom] note — nobody has joined $ID yet; this message waits until they do."
+    fi
+  fi
 
   # --watch: re-arm the watcher in the same process, so "reply" and "keep
   # listening" are one atomic action — no separate re-arm step to forget.
@@ -494,19 +590,51 @@ _watch_check() {
 
   wm="$(get_watermark "$ME" "$ID")"
 
-  # Stop the moment the channel is closed — by anyone. (Keyed off `closed-by:`,
-  # not the last message author, so a close still fires even when I sent last.)
-  local closer; closer="$(closed_by "$path")"
-  if [[ -n "$closer" ]]; then
-    echo "[intercom] channel $ID closed by ${closer:-?}"
-    exit $EX_CLOSED
-  fi
-  local inbound; inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
+  local closer inbound pfins ackf
+  closer="$(closed_by "$path")"
+  pfins="$(peer_fins "$path" "$ME")"
+  inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
+
+  # DRAIN BEFORE REPORTING A CLOSE. The close check used to run first and exit
+  # immediately, so a message written just before a close was never printed — the
+  # watcher woke, saw `closed-by:`, and the caller stopped on exit 20 with the
+  # final message still sitting unshown on disk. That is not rare: across 63
+  # closed channels, 42 stranded their last message exactly this way. Deliver
+  # first, then report the close in the SAME output, so exit 20/21 always carries
+  # whatever was said on the way out.
   if (( inbound > wm )); then
     echo "[intercom] new on $ID:"       # per-message "from#seq:" carries the rest
     cmd_read --me "$ME" --id "$ID" --peek   # doorbell: deliver, but DON'T advance
     echo "[intercom] (shown via watcher; watermark unchanged — your reply's \`send\` acks it, or run \`read\`/\`tail\` if this output was truncated)"
+    if [[ -n "$closer" ]]; then
+      echo "[intercom] ⚠ channel $ID is CLOSED (by $closer) — the above is the FINAL delivery. You cannot reply; \`read\` to ack, then stop."
+      exit $EX_CLOSED
+    fi
+    if [[ -n "$pfins" ]]; then
+      ackf="$(fin_ackfile "$ME" "$ID")"; mkdir -p "$(dirname "$ackf")"
+      printf '%s\n' "$pfins" > "$ackf"
+      echo "[intercom] $pfins has half-closed $ID (done sending, still receiving) — reply if you still need them, then \`close\` your side."
+      exit $EX_FIN
+    fi
     exit $EX_NEW
+  fi
+
+  # Fully closed with nothing left to deliver: the conversation is over.
+  if [[ -n "$closer" ]]; then
+    echo "[intercom] channel $ID closed by ${closer:-?}"
+    exit $EX_CLOSED
+  fi
+
+  # Peer half-closed and I have nothing unread. Report it ONCE — re-arming after a
+  # half-close must not exit 21 on every poll, or the session spins on wake/re-arm.
+  if [[ -n "$pfins" ]]; then
+    ackf="$(fin_ackfile "$ME" "$ID")"
+    if [[ "$(cat "$ackf" 2>/dev/null || true)" != "$pfins" ]]; then
+      mkdir -p "$(dirname "$ackf")"; printf '%s\n' "$pfins" > "$ackf"
+      echo "[intercom] $pfins half-closed $ID (done sending, still receiving)."
+      echo "[intercom] Send anything still outstanding; \`close\` your side when done (that ends the channel)."
+      exit $EX_FIN
+    fi
   fi
   return 0
 }
@@ -526,6 +654,10 @@ cmd_watch() {
   if [[ ! -f "$(watermark_file "$ME" "$ID")" ]]; then
     local seed; seed="$(max_seq "$path")"; set_watermark "$ME" "$ID" "${seed:-0}"
   fi
+
+  # Arm the out-of-session safety net alongside every watcher. This process is
+  # the one that gets reaped; the sentinel is what still notices afterwards.
+  [[ -z "${INTERCOM_NO_SENTINEL:-}" ]] && spawn_sentinel "$ME" "$ID"
 
   SEEN_STAMP="$(basename "$path")"
   local mode="poll" elapsed=0 rc
@@ -568,6 +700,104 @@ cmd_watch() {
   done
 }
 
+# ----------------------------------------------------------------------------
+# Sentinel — the out-of-session safety net.
+#
+# The in-session `watch` is a background child of the Claude Code process, and
+# the harness reaps it: of 131 observed watcher deaths, 119 were external kills,
+# at a median of 29 minutes into a 60-minute budget. The damaging part is WHEN it
+# dies — during the idle stretch after a turn ends, which is after the Stop guard
+# has already run and passed. Nothing inside the session can notice, no further
+# Stop fires, and the channel simply goes quiet until a human happens to poke it.
+#
+# The sentinel is deliberately NOT a child of the session: it double-forks into
+# its own session (setsid), so a session reap, resume, compaction, or exit leaves
+# it running. It cannot wake the model — only a completing background task does
+# that — so its job is to wake the HUMAN: when a message sits unread with no
+# watcher armed, it fires an OS notification naming the session that went deaf.
+#
+# It is a pure observer: never advances a watermark, never writes a .peek, never
+# appends to the channel. Losing one costs nothing but the notification.
+cmd_sentinel() {
+  parse_args "$@"
+  [[ -n "$ME" ]] || die "sentinel requires --me <label>"
+  [[ -n "$ID" ]] || die "sentinel requires --id <id>"
+  valid_label "$ME"
+  ensure_dirs
+
+  if (( SPAWN )); then spawn_sentinel "$ME" "$ID"; return 0; fi
+
+  sentinel_running "$ME" "$ID" && { echo "sentinel already running for $ME/$ID"; return 0; }
+
+  local pf; pf="$(sentinel_pidfile "$ME" "$ID")"
+  mkdir -p "$(dirname "$pf")"; printf '%s\n' "$$" > "$pf"
+  # shellcheck disable=SC2064
+  trap "rm -f '$pf' 2>/dev/null || true" EXIT
+
+  local poll="${INTERCOM_SENTINEL_POLL_SECS:-20}"
+  local grace="${INTERCOM_SENTINEL_GRACE_SECS:-120}"     # let the real watcher win first
+  local renotify="${INTERCOM_SENTINEL_RENOTIFY_SECS:-1800}"
+  local maxlife="${INTERCOM_SENTINEL_MAX_SECS:-86400}"
+  local deaf_since=0 last_seq=0 last_at=0
+  local path shown inbound
+
+  echo "[sentinel] watching $ID as $ME (pid $$, poll ${poll}s, grace ${grace}s)"
+  SECONDS=0
+  while (( SECONDS < maxlife )); do
+    sleep "$poll"
+    path="$(channel_path "$ID")"
+    [[ -n "$path" ]] || { echo "[sentinel] channel file gone; exiting"; return 0; }
+    if [[ -n "$(closed_by "$path")" ]]; then
+      echo "[sentinel] channel closed; exiting"
+      return 0
+    fi
+    shown="$(shown_seq "$ME" "$ID")"
+    inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
+    if (( inbound <= shown )); then deaf_since=0; continue; fi
+    # Unread. If a watcher is armed it will deliver — that's the normal path.
+    if watcher_alive "$ID"; then deaf_since=0; continue; fi
+    (( deaf_since == 0 )) && deaf_since=$SECONDS
+    (( SECONDS - deaf_since < grace )) && continue
+    if (( inbound != last_seq || SECONDS - last_at >= renotify )); then
+      echo "[sentinel] $(now_utc) unread MSG $inbound, no watcher armed — notifying"
+      alert_user "intercom: $ME is not listening on $ID" \
+                 "MSG $inbound is unread and no watcher is armed - that session was reaped and needs a poke."
+      last_seq=$inbound; last_at=$SECONDS
+    fi
+  done
+  echo "[sentinel] max lifetime reached; exiting"
+}
+
+# Detach a sentinel from this process tree and return immediately. Double-fork +
+# setsid so it is reparented to init with no controlling terminal — a session-wide
+# reap or a Claude Code restart must not take it with them. macOS ships no
+# setsid(1), hence python3; the nohup fallback is weaker (survives SIGHUP only)
+# but better than nothing.
+spawn_sentinel() {
+  local me="$1" id="$2" log self
+  sentinel_running "$me" "$id" && return 0
+  log="$(sentinel_logfile "$me" "$id")"
+  mkdir -p "$(dirname "$log")"
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  if command -v python3 >/dev/null 2>&1; then
+    INTERCOM_DIR="$COMMS_DIR" python3 -c '
+import os, sys
+script, me, cid, log = sys.argv[1:5]
+if os.fork() > 0: sys.exit(0)          # parent returns to the shell at once
+os.setsid()                            # new session: no controlling terminal
+if os.fork() > 0: os._exit(0)          # grandchild cannot reacquire one
+os.chdir("/")
+fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+os.dup2(fd, 1); os.dup2(fd, 2)
+null = os.open(os.devnull, os.O_RDONLY); os.dup2(null, 0)
+os.execv(script, [script, "sentinel", "--me", me, "--id", cid])
+' "$self" "$me" "$id" "$log" 2>/dev/null || true
+  else
+    INTERCOM_DIR="$COMMS_DIR" nohup "$self" sentinel --me "$me" --id "$id" >>"$log" 2>&1 &
+    disown 2>/dev/null || true
+  fi
+}
+
 cmd_list() {
   parse_args "$@"
   ensure_dirs
@@ -582,9 +812,16 @@ cmd_list() {
     topic="$(grep -m1 '^topic: ' "$f" | sed 's/^topic: //')"
     parts="$(participants "$f" | paste -sd, -)"
     top="$(max_seq "$f")"; top="${top:-0}"
-    if grep -q '^--- CHANNEL CLOSED ---' "$f"; then state="closed"; else state="open"; fi
+    if grep -q '^--- CHANNEL CLOSED ---' "$f"; then
+      state="closed"
+    elif [[ -n "$(fin_labels "$f")" ]]; then
+      state="half"
+    else
+      state="open"
+    fi
     printf '%-8s  id:%s\n' "[$state]" "$id"
     printf '          topic:%s\n' "${topic:-(none)}"
+    [[ "$state" == "half" ]] && printf '          half-closed-by:%s (done sending, still receiving)\n' "$(fin_labels "$f" | paste -sd, -)"
     printf '          participants:%s  last:%s by %s\n' "${parts:-?}" "$top" "${author:-?}"
     if [[ -n "$ME" ]]; then
       wm="$(get_watermark "$ME" "$id")"
@@ -606,46 +843,100 @@ cmd_status() {
   path="$(require_channel "$ID")"
   top="$(max_seq "$path")"; top="${top:-0}"
   closer="$(closed_by "$path")"
-  echo "channel $ID | latest:seq $top${closer:+ | CLOSED by $closer}"
+  local fins; fins="$(fin_labels "$path" | paste -sd, - || true)"
+  echo "channel $ID | latest:seq $top${closer:+ | CLOSED by $closer}${fins:+ | half-closed: $fins}"
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     wm="$(get_watermark "$p" "$ID")"; (( wm > top )) && wm=$top
     (( wm >= top )) && mark="caught-up" || mark="behind"
-    printf '  %-12s read %s/%s (%s)%s\n' "$p" "$wm" "$top" "$mark" \
-      "$([[ "$p" == "$ME" ]] && printf ' [you]')"
+    printf '  %-12s read %s/%s (%s)%s%s\n' "$p" "$wm" "$top" "$mark" \
+      "$([[ "$p" == "$ME" ]] && printf ' [you]')" \
+      "$(has_fin "$path" "$p" && printf ' [done sending]')"
   done <<< "$(participants "$path")"
+  if [[ -z "$closer" ]] && ! watcher_alive "$ID"; then
+    echo "  ⚠ no watcher armed on this machine — nobody will be woken by a new message"
+  fi
 }
 
+# HALF-CLOSE (a FIN, as in TCP). `close` used to be unilateral and instant: one
+# side wrote the close marker and the other's watcher exited 20 mid-conversation,
+# whether or not it still had something to say — and whether or not it had even
+# been shown the last message. Now `close` means "I am done SENDING": I keep
+# receiving, and the channel only goes fully closed once every participant has
+# said it. `--force` keeps the old hard close for a peer that is genuinely gone —
+# a strictly mutual close would deadlock exactly then, which (given how often a
+# watcher gets reaped) is the common case, not the rare one.
 cmd_close() {
   parse_args "$@"
   [[ -n "$ME" ]] || die "close requires --me <label>"
   [[ -n "$ID" ]] || die "close requires --id <id>"
+  valid_label "$ME"
 
   acquire_lock "$ID"
   local path; path="$(require_channel "$ID")"
-  {
-    echo "--- CHANNEL CLOSED ---"
-    echo "closed-by: $ME"
-    echo "closed-at: $(now_utc)"
-    echo
-  } >> "$path"
-  touch_stamp "$path" "$ID" >/dev/null
-  echo "closed $ID"
+
+  local closer; closer="$(closed_by "$path")"
+  if [[ -n "$closer" ]]; then
+    echo "channel $ID is already fully closed (by $closer) — nothing to do"
+    return 0
+  fi
+
+  # Don't walk away from something you were never shown. This is a half-close, so
+  # the message isn't lost either way, but you should see it before you stop
+  # talking — peek only, so a later `read` still delivers it.
+  local shown inbound
+  shown="$(shown_seq "$ME" "$ID")"
+  inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
+  if (( inbound > shown )); then
+    echo "[intercom] ⚠ you have inbound message(s) you were never shown on $ID:"
+    cmd_read --me "$ME" --id "$ID" --peek
+    echo "[intercom] ↑ read these before you stop; your half-close does NOT discard them."
+  fi
+
+  if ! has_fin "$path" "$ME"; then
+    { echo "closing-by: $ME"; echo "closing-at: $(now_utc)"; echo; } >> "$path"
+  fi
+
+  # Everyone who hasn't FIN'd yet. A label that once read the channel and then
+  # vanished would hold it half-open forever — that's what --force is for.
+  local pending
+  pending="$(comm -23 <(participants "$path") <(fin_labels "$path" | sort -u) | paste -sd, - || true)"
+
+  if (( FORCE )) || [[ -z "$pending" ]]; then
+    {
+      echo "--- CHANNEL CLOSED ---"
+      echo "closed-by: $ME"
+      echo "closed-at: $(now_utc)"
+      (( FORCE )) && [[ -n "$pending" ]] && echo "close-mode: forced (did not wait for: $pending)"
+      echo
+    } >> "$path"
+    touch_stamp "$path" "$ID" >/dev/null
+    if (( FORCE )) && [[ -n "$pending" ]]; then
+      echo "force-closed $ID (did not wait for: $pending)"
+    else
+      echo "closed $ID (all participants half-closed)"
+    fi
+  else
+    touch_stamp "$path" "$ID" >/dev/null
+    echo "half-closed $ID — you are done sending, still receiving."
+    echo "waiting on: $pending  (channel closes when they close too; \`close --force\` to end it now)"
+  fi
 }
 
 # ----------------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------------
-[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|tail|watch|status|list|close} [args]"
+[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|tail|watch|sentinel|status|list|close} [args]"
 sub="$1"; shift || true
 case "$sub" in
-  open)   cmd_open   "$@" ;;
-  send)   cmd_send   "$@" ;;
-  read)   cmd_read   "$@" ;;
-  tail)   cmd_tail   "$@" ;;
-  watch)  cmd_watch  "$@" ;;
-  status) cmd_status "$@" ;;
-  list)   cmd_list   "$@" ;;
-  close)  cmd_close  "$@" ;;
+  open)     cmd_open     "$@" ;;
+  send)     cmd_send     "$@" ;;
+  read)     cmd_read     "$@" ;;
+  tail)     cmd_tail     "$@" ;;
+  watch)    cmd_watch    "$@" ;;
+  sentinel) cmd_sentinel "$@" ;;
+  status)   cmd_status   "$@" ;;
+  list)     cmd_list     "$@" ;;
+  close)    cmd_close    "$@" ;;
   *) die "unknown subcommand: $sub" ;;
 esac
