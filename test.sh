@@ -181,11 +181,14 @@ no  "tail -n 1 drops older" "$out" "t1"
 st="$("$S" status --id "$IDL")"; has "tail advanced no watermark" "$st" "behind"
 
 echo "== stop guard =="
-mkfake() { local f="$WORK/transcript.jsonl"; printf '{"role":"x","text":"ran %s --me %s --id ..."}\n' "$S" "$1" > "$f"; echo "$f"; }
+# A fake transcript names the label AND the channel id, like a real one does
+# (the guard scopes to this session's ids, not to every channel sharing a label).
+mkfake() { local f="$WORK/transcript-$1.jsonl"
+  printf '{"role":"x","text":"ran %s --me %s --id %s"}\n' "$S" "$1" "${2:-}" > "$f"; echo "$f"; }
 hookin() { printf '{"transcript_path":"%s","stop_hook_active":false}' "$1"; }
 # open channel, label G participated (read it), no watcher -> BLOCK
 IDG="$(newid H)"; "$S" send --me H --id "$IDG" --msg hi >/dev/null; "$S" read --me G --id "$IDG" >/dev/null 2>&1
-TR="$(mkfake G)"
+TR="$(mkfake G "$IDG")"
 out="$(hookin "$TR" | "$GUARD")"; has "guard blocks open+no-watcher" "$out" '"decision":"block"'
 has "guard names the channel" "$out" "$IDG"
 # with a live watcher -> ALLOW
@@ -196,9 +199,13 @@ kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
 # stale open channel (untouched > 1h) -> ALLOW (abandoned, not mid-conversation)
 IDS="$(newid P)"; "$S" send --me P --id "$IDS" --msg x >/dev/null; "$S" read --me Q --id "$IDS" >/dev/null 2>&1
 sf=( "$WORK/${IDS}__"*.txt ); touch -t 202001010000 "${sf[0]}"
-out="$(hookin "$(mkfake Q)" | "$GUARD")"; eq "guard skips stale channel" "${out:-EMPTY}" "EMPTY"
-# closed channel -> ALLOW
+out="$(hookin "$(mkfake Q "$IDS")" | "$GUARD")"; eq "guard skips stale channel" "${out:-EMPTY}" "EMPTY"
+# half-closed by the PEER -> still BLOCK: a FIN from H means H is done sending,
+# G keeps receiving, so G still needs a watcher armed.
 "$S" close --me H --id "$IDG" >/dev/null
+out="$(hookin "$TR" | "$GUARD")"; has "guard still blocks on peer half-close" "$out" '"decision":"block"'
+# fully closed (every side FIN'd) -> ALLOW
+"$S" close --me G --id "$IDG" >/dev/null
 out="$(hookin "$TR" | "$GUARD")"; eq "guard allows when closed" "${out:-EMPTY}" "EMPTY"
 # stop_hook_active true -> ALLOW (loop guard)
 out="$(printf '{"transcript_path":"%s","stop_hook_active":true}' "$TR" | "$GUARD")"
@@ -207,6 +214,26 @@ eq "guard respects stop_hook_active" "${out:-EMPTY}" "EMPTY"
 printf '{"role":"x","text":"nothing here"}\n' > "$WORK/empty.jsonl"
 out="$(printf '{"transcript_path":"%s/empty.jsonl","stop_hook_active":false}' "$WORK" | "$GUARD")"
 eq "guard allows non-intercom session" "${out:-EMPTY}" "EMPTY"
+
+echo "== stop guard: same label, different channels (no cross-session bleed) =="
+# Two sessions on one repo both call themselves M and share .state/M/. Each is on
+# its own channel, both open with no watcher armed. Neither may be nagged about
+# the other's channel — it isn't in its transcript and it cannot re-arm it.
+IDM1="$(newid W)"; "$S" send --me W --id "$IDM1" --msg one >/dev/null
+"$S" read --me M --id "$IDM1" >/dev/null 2>&1
+IDM2="$(newid W)"; "$S" send --me W --id "$IDM2" --msg two >/dev/null
+"$S" read --me M --id "$IDM2" >/dev/null 2>&1
+out="$(hookin "$(mkfake M "$IDM2")" | "$GUARD")"
+has "guard blocks on this session's channel" "$out" "$IDM2"
+no  "guard ignores same-label channel from another session" "$out" "$IDM1"
+# ...and once THIS session's channel is closed, the sibling's open one must not
+# keep it from stopping.
+"$S" close --me W --id "$IDM2" >/dev/null; "$S" close --me M --id "$IDM2" >/dev/null
+out="$(hookin "$(mkfake M "$IDM2")" | "$GUARD")"
+eq "guard allows when only another session's channel is open" "${out:-EMPTY}" "EMPTY"
+# A transcript with a label but no id at all -> fail open (never wedge a session).
+out="$(hookin "$(mkfake M)" | "$GUARD")"
+eq "guard fails open when no id in transcript" "${out:-EMPTY}" "EMPTY"
 
 echo "== crossed write: a send must not ack a message it never showed me =="
 # B writes while A is composing (no watcher armed — the watcher exits on delivery,

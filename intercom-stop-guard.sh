@@ -4,8 +4,9 @@
 #
 # If THIS session is on an OPEN intercom channel but has no watcher armed, block
 # the stop and nudge the model to re-arm (or close) — otherwise it would never be
-# woken when the other side replies. Scoped by the session's intercom *label*
-# (which the model writes literally as `--me <label>`), not by channel id.
+# woken when the other side replies. Scoped to (session's `--me` label) ∩ (channel
+# ids that appear in this session's transcript): the label alone is not a session
+# identity, since .state/<label>/ is shared by every session using that label.
 #
 # Fail-open EVERYWHERE: a Stop guard must never wedge a session. Any uncertainty
 # -> allow the stop.
@@ -48,6 +49,29 @@ me="$(tail -n 2000 "$transcript" 2>/dev/null \
   | grep -oE -- '--me [A-Za-z0-9_-]+' | tail -1 | awk '{print $2}')"
 [[ -n "$me" ]] || allow                      # session never used intercom
 
+# Channel ids THIS session actually touched.
+#
+# The label is NOT a session identity: two sessions on the same repo routinely
+# pick the same `--me` (both "backend"), and .state/<label>/ is shared between
+# them. A label-only scan therefore blocks session A's stop over session B's
+# open channel — a channel A has never seen and cannot re-arm. Intersect with the
+# ids present in this transcript to get a per-session view.
+#
+# A channel id is a distinctive token (6 hex + `-` + UTC stamp) and every
+# open/watch banner prints it verbatim, so any channel with recent activity in
+# this session leaves its literal id in the transcript. Also accept `--id <tok>`
+# for robustness; a literal `$ID` from the documented `--id "$ID"` idiom simply
+# matches no state entry.
+#
+# Scanned over a byte-tail rather than the 2000-line window used for the label:
+# with `--id "$ID"` the id may appear only in command OUTPUT, which is sparser
+# than the commands themselves.
+scan_bytes="${GUARD_SCAN_BYTES:-4000000}"
+mine="$( { tail -c "$scan_bytes" "$transcript" | grep -oE '[0-9a-f]{6}-[0-9]{8}T[0-9]{6}Z'
+           tail -c "$scan_bytes" "$transcript" | grep -oE -- '--id [A-Za-z0-9_.-]+' \
+             | awk '{print $2}'; } 2>/dev/null | sort -u)"
+[[ -n "$mine" ]] || allow                    # no channel attributable to this session
+
 # Open channels this label has touched (a watermark file exists per interaction),
 # that currently have NO live watcher process.
 [[ -d "$STATE_DIR/$me" ]] || allow
@@ -55,6 +79,8 @@ shopt -s nullglob
 unguarded_id=""
 for wf in "$STATE_DIR/$me"/*; do
   id="$(basename "$wf")"
+  # Same label, different session -> not ours to re-arm or to be nagged about.
+  printf '%s\n' "$mine" | grep -qxF -- "$id" || continue
   files=( "$COMMS_DIR/${id}__"*.txt )
   (( ${#files[@]} )) || continue             # channel file gone
   grep -q '^--- CHANNEL CLOSED ---' "${files[0]}" && continue   # already closed
