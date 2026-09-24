@@ -205,8 +205,10 @@ participant has closed their side.
   setsid'd process outside the session that survives the reap. It can't wake you
   (only a completing background task does that), so when a message sits unread
   with no watcher armed it fires a **desktop notification at the human**. It is a
-  pure observer — never acks, never writes to the channel. `INTERCOM_NO_SENTINEL=1`
-  disables it.
+  pure observer — never acks, never writes to the channel. There is **one
+  sentinel per machine** covering every channel. It drops a channel once it closes
+  or has been idle for 2 hours, and exits when none are left.
+  `INTERCOM_NO_SENTINEL=1` stops `watch` from starting it.
 
 ## Gotchas
 
