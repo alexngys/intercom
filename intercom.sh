@@ -6,7 +6,7 @@
 # append-only file under ~/.claude/comms/. Each session keeps doing its own work
 # and is re-invoked (via a backgrounded `watch`) when the other side replies.
 #
-# Subcommands: open | send | read | tail | watch | sentinel | status | list | close
+# Subcommands: open | send | read | tail | watch | sentinel | status | health | list | close
 # See SKILL.md for usage from a Claude Code session.
 
 set -euo pipefail
@@ -133,18 +133,25 @@ peer_fins() {
   fin_labels "$path" | grep -vxF "$me" | paste -sd, - || true
 }
 
-# Is a `watch` alive for this channel on THIS machine (excluding my own process)?
-# Same probe the Stop guard uses. Cross-machine setups have no visibility into
-# the peer's process table — set INTERCOM_NO_PS=1 there to silence the warning.
-watcher_alive() {
+# Is a `watch` running for this channel on THIS machine (excluding my own
+# process)? A plain process-table fact, used where the answer is always local:
+# the sentinel and the Stop guard (via `health`) ask about their own watcher.
+watcher_running() {
   local id="$1" pid args
-  [[ -n "${INTERCOM_NO_PS:-}" ]] && return 0
   while read -r pid args; do
     [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
     [[ "$args" == *intercom.sh* && "$args" == *"$id"* && "$args" != *sentinel* ]] || continue
     [[ "$args" == *" watch "* || "$args" == *" watch" || "$args" == *--watch* ]] && return 0
   done < <(ps -Ao pid=,args= 2>/dev/null)
   return 1
+}
+
+# Is the PEER listening? Same probe, but cross-machine setups have no view of the
+# peer's process table — INTERCOM_NO_PS=1 there silences the "nobody is
+# listening" warnings rather than firing them on every send.
+watcher_alive() {
+  [[ -n "${INTERCOM_NO_PS:-}" ]] && return 0
+  watcher_running "$1"
 }
 
 # Distinct participant labels in a channel: the opener, every message sender, AND
@@ -256,6 +263,89 @@ sentinel_running() {
   [[ -f "$pf" ]] || return 1
   pid="$(cat "$pf" 2>/dev/null)"; [[ -n "$pid" ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# Reap tracking.
+#
+# Under memory pressure the harness kills backgrounded watchers within seconds of
+# arming them, over and over. On its own that is harmless — the watcher is only a
+# doorbell and never moves the watermark — but the Stop guard turned it into a
+# loop: arm → reaped → guard demands a re-arm → arm → reaped … each cycle a tool
+# call that buys nothing, and each "watcher armed" report is false within
+# seconds. To break the loop something has to REMEMBER the deaths.
+#
+# Every watcher drops an arm record `<id>.watch.<pid>` holding its start epoch.
+# A clean exit (any EX_* code, or a die) removes it. An external kill leaves it
+# behind: a trappable SIGTERM logs the reap itself on the way out; an untrappable
+# SIGKILL leaves the record for the next scan (sentinel, status, next arm, Stop
+# guard) to find with a dead pid. Either way one line lands in `<id>.reaps`:
+#   <death_epoch> <lived_secs> <pid> <TERM|gone>
+# ----------------------------------------------------------------------------
+REAP_WINDOW_SECS="${INTERCOM_REAP_WINDOW_SECS:-1800}" # look-back window for "recent" reaps
+REAP_FAST_SECS="${INTERCOM_REAP_FAST_SECS:-600}"      # died younger than this = fast reap
+REAP_LIMIT="${INTERCOM_REAP_LIMIT:-2}"                # fast reaps in window => UNSTABLE
+
+reaps_file()  { printf '%s\n' "$STATE_DIR/$1/$2.reaps"; }
+arm_record()  { printf '%s\n' "$STATE_DIR/$1/$2.watch.$3"; }
+
+log_reap() {  # me id lived pid how
+  local rf; rf="$(reaps_file "$1" "$2")"
+  mkdir -p "$(dirname "$rf")"
+  printf '%s %s %s %s\n' "$(date +%s)" "$3" "$4" "$5" >> "$rf"
+}
+
+# Convert arm records whose process is gone into reap log entries. The `mv` to a
+# unique name is the claim: when two scanners race, exactly one wins the rename,
+# so a death is logged once.
+reap_scan() {
+  local me="$1" id="$2" rec pid started now claim args
+  now="$(date +%s)"
+  for rec in "$STATE_DIR/$me/$id".watch.*; do
+    [[ -f "$rec" ]] || continue
+    pid="${rec##*.}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # Alive AND still an intercom process (pid reuse must not mask a death).
+    args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+    [[ "$args" == *intercom.sh* ]] && continue
+    claim="$rec.claimed.$$"
+    mv "$rec" "$claim" 2>/dev/null || continue
+    started="$(cat "$claim" 2>/dev/null || echo "$now")"
+    [[ "$started" =~ ^[0-9]+$ ]] || started="$now"
+    log_reap "$me" "$id" "$(( now - started ))" "$pid" gone
+    rm -f "$claim"
+  done
+}
+
+# Summary of recent reaps for (me, id). Sets:
+#   REAP_RECENT  reaps inside the window
+#   REAP_FAST    of those, how many died younger than REAP_FAST_SECS
+#   REAP_LAST_LIVED / REAP_LAST_AGO  the most recent one (empty if none)
+#   REAP_UNSTABLE 1 when REAP_FAST >= REAP_LIMIT — armed watchers are not holding
+reap_summary() {
+  local rf now line
+  rf="$(reaps_file "$1" "$2")"; now="$(date +%s)"
+  REAP_RECENT=0; REAP_FAST=0; REAP_LAST_LIVED=""; REAP_LAST_AGO=""; REAP_UNSTABLE=0
+  [[ -f "$rf" ]] || return 0
+  line="$(awk -v now="$now" -v win="$REAP_WINDOW_SECS" -v fast="$REAP_FAST_SECS" '
+    $1 ~ /^[0-9]+$/ && now - $1 <= win { r++; if ($2 < fast) f++; ll = $2; la = now - $1 }
+    END { printf "%d %d %s %s\n", r, f, ll, la }
+  ' "$rf" 2>/dev/null || true)"
+  read -r REAP_RECENT REAP_FAST REAP_LAST_LIVED REAP_LAST_AGO <<< "$line"
+  REAP_RECENT="${REAP_RECENT:-0}"; REAP_FAST="${REAP_FAST:-0}"
+  (( REAP_FAST >= REAP_LIMIT )) && REAP_UNSTABLE=1
+  return 0
+}
+
+# Human-readable one-liner for the summary reap_summary() last computed, or
+# nothing when there were no recent reaps. Formatting only: callers run
+# reap_summary themselves so its REAP_* results land in their own shell, not in
+# the $(…) subshell this is usually called from.
+reap_line() {
+  (( REAP_RECENT > 0 )) || return 0
+  local mins=$(( REAP_WINDOW_SECS / 60 ))
+  printf 'watcher reaped %s× in the last %sm (%s within %ss of arming); last one lived %ss, %ss ago' \
+    "$REAP_RECENT" "$mins" "$REAP_FAST" "$REAP_FAST_SECS" "$REAP_LAST_LIVED" "$REAP_LAST_AGO"
 }
 
 # Highest seq NOT from $2 — the newest INBOUND message. The watcher used to gate
@@ -454,7 +544,6 @@ cmd_send() {
   # --watch: re-arm the watcher in the same process, so "reply" and "keep
   # listening" are one atomic action — no separate re-arm step to forget.
   if (( WATCH_AFTER )); then
-    valid_label "$ME"
     cmd_watch --me "$ME" --id "$ID"
   fi
 }
@@ -555,7 +644,12 @@ wait_for_change() {
   if command -v fswatch >/dev/null 2>&1; then
     local wpid tpid rc=0
     fswatch -1 "$COMMS_DIR" >/dev/null 2>&1 & wpid=$!
-    ( sleep "$timeout"; kill "$wpid" 2>/dev/null ) & tpid=$!
+    # The timer must take its own `sleep` down when killed: a plain
+    # `( sleep; kill )` dies on SIGTERM and orphans the sleep to init, which
+    # then holds our stdout for the rest of the timeout.
+    ( trap 'kill "$s" 2>/dev/null; exit 0' TERM
+      sleep "$timeout" & s=$!; wait "$s"; kill "$wpid" 2>/dev/null ) & tpid=$!
+    _WPID=$wpid; _TPID=$tpid   # for _watch_cleanup if we are killed mid-wait
     wait "$wpid" 2>/dev/null || rc=1
     # Always reap the timer child, on EVERY path. Orphaned, it inherits our
     # stdout and holds a backgrounded watcher's pipe open for the whole timeout
@@ -563,6 +657,7 @@ wait_for_change() {
     # an hour after it died, and we leak one `sleep` per failed iteration.
     kill "$tpid" 2>/dev/null || true
     wait "$tpid" 2>/dev/null || true
+    _WPID=""; _TPID=""
     return $rc
   elif command -v inotifywait >/dev/null 2>&1; then
     inotifywait -q -t "$timeout" -e create,moved_to,modify,close_write \
@@ -572,10 +667,9 @@ wait_for_change() {
 }
 
 # Re-check the channel after a wakeup; exits the process if there's something
-# actionable (new inbound messages or a close). $SEEN_STAMP persists the last
-# filename stamp we observed so our own writes / noise don't re-trigger.
+# actionable (new inbound messages or a close).
 _watch_check() {
-  local path cur_stamp wm
+  local path wm
   path="$(channel_path "$ID")"
   [[ -n "$path" ]] || die "channel '$ID' disappeared"
   # Deliberately NO early-return on an unchanged filename stamp. The __<lastmod>
@@ -585,9 +679,6 @@ _watch_check() {
   # to bump it, which on a "your turn now" pause is never, and the watcher sits
   # out its whole idle budget with a message already on disk. Re-derive the real
   # state from the file instead; three greps every couple of seconds is nothing.
-  cur_stamp="$(basename "$path")"
-  SEEN_STAMP="$cur_stamp"
-
   wm="$(get_watermark "$ME" "$ID")"
 
   local closer inbound pfins ackf
@@ -639,6 +730,22 @@ _watch_check() {
   return 0
 }
 
+# EXIT trap for a watcher. Every exit path passes through here: the EX_* codes,
+# `die`, and a trapped SIGTERM. Only the last is a reap. Stops event-mode children
+# too, so a killed watcher doesn't leave an orphaned fswatch/timer holding its
+# output pipe open.
+_watch_cleanup() {
+  [[ -n "${_WPID:-}" ]] && { kill "$_WPID" 2>/dev/null || true; }
+  [[ -n "${_TPID:-}" ]] && { kill "$_TPID" 2>/dev/null || true; }
+  if (( ${WATCH_REAPED:-0} )); then
+    local lived=$(( $(date +%s) - WATCH_T0 ))
+    log_reap "$ME" "$ID" "$lived" "$$" TERM 2>/dev/null
+    echo "[intercom] watcher on $ID was killed externally after ${lived}s — nothing was acked; run \`read\` to recover."
+  fi
+  rm -f "${WATCH_REC:-}" 2>/dev/null
+  return 0
+}
+
 cmd_watch() {
   parse_args "$@"
   [[ -n "$ME" ]] || die "watch requires --me <label>"
@@ -659,10 +766,24 @@ cmd_watch() {
   # the one that gets reaped; the sentinel is what still notices afterwards.
   [[ -z "${INTERCOM_NO_SENTINEL:-}" ]] && spawn_sentinel "$ME" "$ID"
 
-  SEEN_STAMP="$(basename "$path")"
-  local mode="poll" elapsed=0 rc
-  command -v fswatch >/dev/null 2>&1 && mode="event"
-  command -v inotifywait >/dev/null 2>&1 && mode="event"
+  # Arm record + exit bookkeeping (see "Reap tracking"). Log any predecessor that
+  # was SIGKILLed first, so the warning below reflects it.
+  reap_scan "$ME" "$ID"
+  WATCH_REC="$(arm_record "$ME" "$ID" "$$")"; WATCH_T0="$(date +%s)"; WATCH_REAPED=0
+  printf '%s\n' "$WATCH_T0" > "$WATCH_REC"
+  trap 'WATCH_REAPED=1; exit 143' TERM
+  trap '_watch_cleanup' EXIT
+
+  reap_summary "$ME" "$ID"
+  if (( REAP_UNSTABLE )); then
+    echo "[intercom] ⚠ UNSTABLE: $(reap_line)."
+    echo "[intercom]   This watcher will most likely be killed too (usually memory pressure). Do NOT tell the user"
+    echo "[intercom]   you'll be woken. Delivery falls back to the sentinel's desktop notification to the human."
+    echo "[intercom]   If this task is reported killed, don't loop re-arming it: run \`read\` once and move on."
+  fi
+
+  local mode="poll" rc
+  command -v fswatch >/dev/null 2>&1 || command -v inotifywait >/dev/null 2>&1 && mode="event"
   [[ "$mode" == "event" ]] && echo "[intercom] watching $ID (event-driven)" \
                             || echo "[intercom] watching $ID (polling every ${WATCH_POLL_SECS}s)"
 
@@ -686,9 +807,8 @@ cmd_watch() {
       if (( SECONDS >= WATCH_MAX_SECS )); then rc=1; fi
     else
       sleep "$WATCH_POLL_SECS"
-      elapsed=$(( elapsed + WATCH_POLL_SECS ))
       _watch_check
-      (( elapsed >= WATCH_MAX_SECS )) && rc=1 || rc=0
+      (( SECONDS >= WATCH_MAX_SECS )) && rc=1 || rc=0
     fi
     if (( rc == 1 )); then
       local mins=$(( WATCH_MAX_SECS / 60 ))
@@ -751,11 +871,14 @@ cmd_sentinel() {
       echo "[sentinel] channel closed; exiting"
       return 0
     fi
+    # The sentinel is the one process that outlives a SIGKILLed watcher, so it is
+    # the scanner that dates those deaths accurately (to within one poll).
+    reap_scan "$ME" "$ID"
     shown="$(shown_seq "$ME" "$ID")"
     inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
     if (( inbound <= shown )); then deaf_since=0; continue; fi
     # Unread. If a watcher is armed it will deliver — that's the normal path.
-    if watcher_alive "$ID"; then deaf_since=0; continue; fi
+    if watcher_running "$ID"; then deaf_since=0; continue; fi
     (( deaf_since == 0 )) && deaf_since=$SECONDS
     (( SECONDS - deaf_since < grace )) && continue
     if (( inbound != last_seq || SECONDS - last_at >= renotify )); then
@@ -812,7 +935,7 @@ cmd_list() {
     topic="$(grep -m1 '^topic: ' "$f" | sed 's/^topic: //')"
     parts="$(participants "$f" | paste -sd, -)"
     top="$(max_seq "$f")"; top="${top:-0}"
-    if grep -q '^--- CHANNEL CLOSED ---' "$f"; then
+    if [[ -n "$(closed_by "$f")" ]]; then
       state="closed"
     elif [[ -n "$(fin_labels "$f")" ]]; then
       state="half"
@@ -853,9 +976,46 @@ cmd_status() {
       "$([[ "$p" == "$ME" ]] && printf ' [you]')" \
       "$(has_fin "$path" "$p" && printf ' [done sending]')"
   done <<< "$(participants "$path")"
-  if [[ -z "$closer" ]] && ! watcher_alive "$ID"; then
+  [[ -n "$closer" ]] && return 0
+  if watcher_alive "$ID"; then
+    echo "  watcher armed on this machine"
+  else
     echo "  ⚠ no watcher armed on this machine — nobody will be woken by a new message"
   fi
+  # "Armed" and "armed but about to be killed" look identical from the line
+  # above. The reap history is what tells them apart.
+  local line sent
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    reap_scan "$p" "$ID"; reap_summary "$p" "$ID"
+    line="$(reap_line)"
+    [[ -n "$line" ]] || continue
+    if (( REAP_UNSTABLE )); then
+      sentinel_running "$p" "$ID" && sent="sentinel running — it notifies the human" \
+                                  || sent="NO sentinel running — nothing will notify anyone"
+      echo "  ⚠ $p: UNSTABLE — $line. Armed watchers are not holding; $sent."
+    else
+      echo "  $p: $line"
+    fi
+  done <<< "$(participants "$path")"
+}
+
+# Machine-readable reap/watcher state for (me, id), one key=value per line. The
+# Stop guard's input — kept separate from `status` so its wording can change.
+cmd_health() {
+  parse_args "$@"
+  [[ -n "$ME" ]] || die "health requires --me <label>"
+  [[ -n "$ID" ]] || die "health requires --id <id>"
+  valid_label "$ME"
+  reap_scan "$ME" "$ID"
+  reap_summary "$ME" "$ID"
+  echo "reaps_recent=$REAP_RECENT"
+  echo "reaps_fast=$REAP_FAST"
+  echo "last_lived=${REAP_LAST_LIVED}"
+  echo "last_ago=${REAP_LAST_AGO}"
+  echo "unstable=$REAP_UNSTABLE"
+  if sentinel_running "$ME" "$ID"; then echo "sentinel=1"; else echo "sentinel=0"; fi
+  if watcher_running "$ID"; then echo "watcher=1"; else echo "watcher=0"; fi
 }
 
 # HALF-CLOSE (a FIN, as in TCP). `close` used to be unilateral and instant: one
@@ -926,7 +1086,7 @@ cmd_close() {
 # ----------------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------------
-[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|tail|watch|sentinel|status|list|close} [args]"
+[[ $# -ge 1 ]] || die "usage: intercom.sh {open|send|read|tail|watch|sentinel|status|health|list|close} [args]"
 sub="$1"; shift || true
 case "$sub" in
   open)     cmd_open     "$@" ;;
@@ -936,6 +1096,7 @@ case "$sub" in
   watch)    cmd_watch    "$@" ;;
   sentinel) cmd_sentinel "$@" ;;
   status)   cmd_status   "$@" ;;
+  health)   cmd_health   "$@" ;;
   list)     cmd_list     "$@" ;;
   close)    cmd_close    "$@" ;;
   *) die "unknown subcommand: $sub" ;;
