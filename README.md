@@ -117,6 +117,9 @@ machine**:
 | `INTERCOM_SENTINEL_GRACE_SECS` | `120` | How long an unread message may sit before the sentinel decides nobody is listening |
 | `INTERCOM_SENTINEL_RENOTIFY_SECS` | `1800` | Minimum gap between repeat notifications for the same unread message |
 | `INTERCOM_SENTINEL_MAX_SECS` | `86400` | Sentinel lifetime cap |
+| `INTERCOM_REAP_WINDOW_SECS` | `1800` | How far back watcher kills count toward UNSTABLE |
+| `INTERCOM_REAP_FAST_SECS` | `600` | A watcher killed younger than this counts as a fast reap |
+| `INTERCOM_REAP_LIMIT` | `2` | Fast reaps within the window that mark a channel UNSTABLE |
 
 ## Closing a channel: half-close
 
@@ -153,6 +156,17 @@ writes to the channel, and exits when the channel closes. Single-instance per
 Complementing it, `send` warns (and notifies) when the peer has no watcher armed,
 so a message is never left waiting on a session that cannot hear it.
 
+### Watchers that keep dying
+
+Under memory pressure a watcher can be killed seconds after it is armed, every
+time. Each watcher leaves an arm record under `.state/`. A clean exit removes it.
+A SIGTERM is logged by the watcher itself on the way out. A SIGKILL leaves the
+record, and the next scan (by the sentinel, `status`, the next `watch`, or the
+Stop guard) logs it. Both kinds land in `<id>.reaps`. When enough kills come
+soon after arming, the channel is **UNSTABLE**: `status` says so, a new `watch`
+warns that it probably won't survive, and the Stop guard stops asking for a
+re-arm that can't hold. The sentinel's notification is then the delivery path.
+
 ## Optional: the Stop guard (never forget to re-arm)
 
 `intercom-stop-guard.sh` is a Claude Code **Stop hook**. If a session ends a turn
@@ -177,12 +191,18 @@ It is **fail-open**: no label in the transcript, channel closed, a live watcher
 exists, the channel is stale (> `GUARD_STALE_MIN`), or `stop_hook_active` is set →
 it allows the stop. It never wedges a session and never nags non-intercom work.
 
+On an UNSTABLE channel (watchers keep being killed soon after arming) it also
+allows the stop, and shows the user a `systemMessage` explaining that the session
+won't be woken and the sentinel will notify them. Otherwise the guard would
+loop: arm → killed → blocked → arm.
+
 ## Tests
 
 `./test.sh` — self-contained regression suite (throwaway `INTERCOM_DIR`), covers
 every subcommand, all four `watch` exit codes, the half-close protocol, close
 never stranding a final message, read-receipts, typed JSON, the label warning,
-sentinel detachment, and all guard branches. Exit 0 = green.
+sentinel detachment, reap tracking (clean exit / SIGTERM / SIGKILL / UNSTABLE),
+and all guard branches. Exit 0 = green.
 
 ## Quick manual smoke test
 
@@ -205,6 +225,7 @@ ID=$("$S" open --me a --topic test | grep -oE '[a-f0-9]{6}-[0-9T]+Z' | head -1)
 | `tail --id <id> [-n N] [--me <label>]` | Raw last-N messages straight from the log — every message, ignores/touches no watermark; recovery / source-of-truth view |
 | `watch --me <label> --id <id>` | Block (background) until the other side writes; a **doorbell** — shows new messages but does not advance your watermark. Exits `0`=new msg, `10`=1h idle (alerts user), `20`=fully closed, `21`=peer half-closed. Also arms the sentinel |
 | `sentinel --me <label> --id <id> [--spawn]` | Out-of-session watchdog; `--spawn` detaches and returns. Notifies the human when a message is unread with no watcher armed |
-| `status [--me <label>] --id <id>` | Read-receipts: how far each participant has read, who is done sending, and whether any watcher is armed (no write, no wake) |
+| `status [--me <label>] --id <id>` | Read-receipts: how far each participant has read, who is done sending, whether any watcher is armed, and recent watcher kills / UNSTABLE (no write, no wake) |
+| `health --me <label> --id <id>` | Machine-readable `key=value` watcher/reap state (what the Stop guard reads) |
 | `list [--me <label>]` | All channels + participants; with `--me`, an unread count. Marks `[half]` for half-closed |
 | `close --me <label> --id <id> [--force]` | Half-close: "done sending", peer's watcher exits `21`. Full close once all sides have. `--force` hard-closes now |
