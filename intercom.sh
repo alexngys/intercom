@@ -445,7 +445,8 @@ cmd_open() {
   echo "Use the intercom skill to join channel $id. Pick a short label for"
   echo "yourself (e.g. session-B), read the waiting message, reply to it, then"
   echo "arm \`watch\` in the background and keep the conversation going until the"
-  echo "channel is closed."
+  echo "channel is closed. Don't close early: close only once nothing is outstanding"
+  echo "on either side and the other session has confirmed it has no follow-ups."
   echo "------------------------------------------------------------>8---"
 }
 
@@ -1053,6 +1054,16 @@ cmd_close() {
     echo "[intercom] ↑ read these before you stop; your half-close does NOT discard them."
   fi
 
+  # The classic premature close: the peer spoke last and never got a reply. Not
+  # blocked (a half-close still receives), but say so while it can still be
+  # undone by sending.
+  local last; last="$(last_author "$path")"
+  if [[ -n "$last" && "$last" != "$ME" && -z "$(peer_fins "$path" "$ME")" ]]; then
+    echo "[intercom] ⚠ the last message is from $last and you never replied. Are you closing too early?"
+    echo "[intercom]   Close only once nothing is outstanding and they've confirmed there are no follow-ups;"
+    echo "[intercom]   sending anything now reopens your side."
+  fi
+
   if ! has_fin "$path" "$ME"; then
     { echo "closing-by: $ME"; echo "closing-at: $(now_utc)"; echo; } >> "$path"
   fi
@@ -1080,6 +1091,7 @@ cmd_close() {
     touch_stamp "$path" "$ID" >/dev/null
     echo "half-closed $ID — you are done sending, still receiving."
     echo "waiting on: $pending  (channel closes when they close too; \`close --force\` to end it now)"
+    echo "Keep your watcher armed until it fully closes (exit 20) — they may still follow up."
   fi
 }
 
