@@ -295,7 +295,6 @@ out="$(hookin "$TRK" | INTERCOM_REAP_WINDOW_SECS=0 "$GUARD")"
 has "guard blocks again once the reaps age out" "$out" '"decision":"block"'
 out="$(hookin "$TRK" | INTERCOM_REAP_WINDOW_SECS=0 INTERCOM_NO_PS=1 "$GUARD")"
 has "INTERCOM_NO_PS does not disable the guard" "$out" '"decision":"block"'
-for pf in "$WORK"/.state/B/"$IDK".sentinel.pid; do [[ -f "$pf" ]] && kill "$(cat "$pf")" 2>/dev/null; done
 
 echo "== crossed write: a send must not ack a message it never showed me =="
 # B writes while A is composing (no watcher armed — the watcher exits on delivery,
@@ -381,15 +380,18 @@ no "no false alarm while a watcher lives" "$out" "no live watcher"
 wait $WPID 2>/dev/null || true
 
 echo "== sentinel: detaches, survives its spawner, notifies, stays a pure observer =="
-IDS="$(newid A sentinel)"
-"$S" read --me B --id "$IDS" >/dev/null 2>&1
+# Its own comms dir, so it gets a fresh daemon with fast timings (the machine's
+# ONE sentinel keeps the settings of whoever started it).
+SD="$WORK/sent"; mkdir -p "$SD"
+SEN=(env INTERCOM_DIR="$SD" INTERCOM_SENTINEL_POLL_SECS=1 INTERCOM_SENTINEL_GRACE_SECS=1)
+IDS="$(INTERCOM_DIR="$SD" newid A sentinel)"
+INTERCOM_DIR="$SD" "$S" read --me B --id "$IDS" >/dev/null 2>&1
 # Spawn from a subshell that exits immediately: if the sentinel were a plain
 # child it would die with it. That is the entire point of the double-fork.
-( INTERCOM_SENTINEL_POLL_SECS=1 INTERCOM_SENTINEL_GRACE_SECS=1 \
-  "$S" sentinel --me B --id "$IDS" --spawn >/dev/null 2>&1 ) &
+( "${SEN[@]}" "$S" sentinel --me B --id "$IDS" --spawn >/dev/null 2>&1 ) &
 wait $! 2>/dev/null || true
 sleep 2
-PF="$WORK/.state/B/$IDS.sentinel.pid"
+PF="$SD/.state/.sentinel/run/pid"
 if [[ -f "$PF" ]] && kill -0 "$(cat "$PF")" 2>/dev/null; then ok "sentinel outlived its spawner"
 else bad "sentinel outlived its spawner (no live pid at $PF)"; fi
 SPID="$(cat "$PF" 2>/dev/null || echo 0)"
@@ -403,30 +405,52 @@ if [[ "$SPID" != 0 && -n "$SPGID" && "$SPGID" != "$OURPGID" ]]; then
   ok "sentinel left our process group"
 else bad "sentinel shares our process group (pgid=$SPGID ours=$OURPGID)"; fi
 eq "sentinel reparented to init" "$SPPID" "1"
-WM_BEFORE="$(cat "$WORK/.state/B/$IDS" 2>/dev/null || echo 0)"
-"$S" send --me A --id "$IDS" --msg "unread and unwatched" >/dev/null 2>&1
-sleep 6
-eq "sentinel never touched the watermark" "$(cat "$WORK/.state/B/$IDS" 2>/dev/null || echo 0)" "$WM_BEFORE"
-[[ -f "$WORK/.state/B/$IDS.peek" ]] && bad "sentinel wrote a delivery marker" || ok "sentinel wrote no delivery marker"
-has "sentinel logged the deaf channel" "$(cat "$WORK/.state/B/$IDS.sentinel.log" 2>/dev/null || true)" "no watcher armed"
-# A close must retire it rather than leave it running forever.
-"$S" close --me B --id "$IDS" --force >/dev/null 2>&1
-sleep 3
-if kill -0 "$SPID" 2>/dev/null; then bad "sentinel exits on close"; kill "$SPID" 2>/dev/null || true
-else ok "sentinel exits on close"; fi
 
-echo "== sentinel is single-instance =="
-ID2S="$(newid A)"
-"$S" sentinel --me A --id "$ID2S" --spawn >/dev/null 2>&1; sleep 1
-"$S" sentinel --me A --id "$ID2S" --spawn >/dev/null 2>&1; sleep 1
-n="$(ps -Ao args= 2>/dev/null | grep -F 'intercom.sh' | grep -F "$ID2S" | grep -cF 'sentinel' || true)"
-eq "exactly one sentinel per channel" "$n" "1"
-kill "$(cat "$WORK/.state/A/$ID2S.sentinel.pid" 2>/dev/null || echo 0)" 2>/dev/null || true
+echo "== sentinel: ONE process covers every channel =="
+IDS2="$(INTERCOM_DIR="$SD" newid A second)"
+"${SEN[@]}" "$S" sentinel --me B --id "$IDS2" --spawn >/dev/null 2>&1
+"${SEN[@]}" "$S" sentinel --me B --id "$IDS2" --spawn >/dev/null 2>&1   # repeat is a no-op
+sleep 1
+eq "second channel reuses the same daemon" "$(cat "$PF" 2>/dev/null)" "$SPID"
+[[ -f "$SD/.state/.sentinel/B@$IDS2" ]] && ok "second channel registered" || bad "second channel registered"
+eq "health sees the sentinel" "$(INTERCOM_DIR="$SD" "$S" health --me B --id "$IDS2" | grep '^sentinel=')" "sentinel=1"
+
+echo "== sentinel: notifies without touching read state =="
+WM_BEFORE="$(cat "$SD/.state/B/$IDS" 2>/dev/null || echo 0)"
+INTERCOM_DIR="$SD" "$S" send --me A --id "$IDS" --msg "unread and unwatched" >/dev/null 2>&1
+sleep 5
+eq "sentinel never touched the watermark" "$(cat "$SD/.state/B/$IDS" 2>/dev/null || echo 0)" "$WM_BEFORE"
+[[ -f "$SD/.state/B/$IDS.peek" ]] && bad "sentinel wrote a delivery marker" || ok "sentinel wrote no delivery marker"
+has "sentinel logged the deaf channel" "$(cat "$SD/.state/.sentinel/log" 2>/dev/null || true)" "no watcher armed"
+
+echo "== sentinel: drops closed and idle channels, then exits =="
+INTERCOM_DIR="$SD" "$S" close --me B --id "$IDS" --force >/dev/null 2>&1
+sleep 3
+[[ -f "$SD/.state/.sentinel/B@$IDS" ]] && bad "closed channel dropped" || ok "closed channel dropped"
+if kill -0 "$SPID" 2>/dev/null; then ok "still running for the other channel"
+else bad "still running for the other channel"; fi
+# Age the remaining channel and its registration past the idle limit. A running
+# daemon keeps the limit it started with, so restart it with a short one.
+kill "$SPID" 2>/dev/null; sleep 1
+sf=( "$SD/${IDS2}__"*.txt ); touch -t 202001010000 "${sf[0]}"
+printf '1 0 0 0\n' > "$SD/.state/.sentinel/B@$IDS2"
+( env INTERCOM_DIR="$SD" INTERCOM_SENTINEL_POLL_SECS=1 INTERCOM_SENTINEL_IDLE_SECS=60 \
+    "$S" sentinel >/dev/null 2>&1 & )
+sleep 3
+[[ -f "$SD/.state/.sentinel/B@$IDS2" ]] && bad "idle channel dropped" || ok "idle channel dropped"
+SPID2="$(cat "$PF" 2>/dev/null || echo 0)"
+if [[ "$SPID2" != 0 ]] && kill -0 "$SPID2" 2>/dev/null; then bad "exits once nothing is left"; kill "$SPID2" 2>/dev/null
+else ok "exits once nothing is left"; fi
+[[ -d "$SD/.state/.sentinel/run" ]] && bad "released its lock" || ok "released its lock"
+# ...and a later spawn starts a fresh one.
+IDS3="$(INTERCOM_DIR="$SD" newid A third)"
+"${SEN[@]}" "$S" sentinel --me B --id "$IDS3" --spawn >/dev/null 2>&1; sleep 1
+if [[ -f "$PF" ]] && kill -0 "$(cat "$PF")" 2>/dev/null; then ok "next spawn starts a new daemon"
+else bad "next spawn starts a new daemon"; fi
 
 # Leave no detached processes behind from this run.
-for pf in "$WORK"/.state/*/*.sentinel.pid; do
-  [[ -f "$pf" ]] || continue
-  kill "$(cat "$pf" 2>/dev/null || echo 0)" 2>/dev/null || true
+for pf in "$WORK"/.state/.sentinel/run/pid "$SD"/.state/.sentinel/run/pid; do
+  [[ -f "$pf" ]] && kill "$(cat "$pf" 2>/dev/null || echo 0)" 2>/dev/null || true
 done
 
 echo
