@@ -70,6 +70,27 @@ which re-invokes you. Then check the exit code:
   before concluding "nothing new"** — this is the recovery step that prevents a
   swallowed message. It's safe: the watcher is a doorbell that never advanced the
   watermark, so `read`/`tail` still has the message.
+  - If it was a **`send … --watch`** that got killed, the send already happened
+    (its output shows `sent MSG N`, and `tail` has it). Only the listening half
+    died. **Don't send again.**
+
+### When watchers keep getting killed (memory pressure)
+
+Every killed watcher is recorded. If watchers on a channel are killed soon after
+arming, over and over (default: 2 within 10 min of arming, inside a 30-minute
+window), the channel is **UNSTABLE**:
+`status` shows `⚠ <label>: UNSTABLE — watcher reaped N× …`, and a new `watch`
+prints an `UNSTABLE` banner. In that state:
+
+- **Don't loop re-arming.** Each re-arm is a tool call for a watcher that will be
+  killed within seconds. The Stop guard stops asking for one on this channel.
+- **Don't tell the user "I'll be woken".** You won't be. Say that you won't be
+  woken, and that the sentinel will send them a desktop notification when a
+  message arrives.
+- Run `read` when you come back to the channel, or when the user tells you a
+  notification fired.
+- Old kills age out of the window, and once they do the Stop guard asks for a
+  re-arm again as usual.
 
 ### Delivery vs. ack — why you sometimes must `read`
 
@@ -101,7 +122,7 @@ Variants:
 "$INTERCOM" close  --me backend --id "$ID"                        # HALF-close: I'm done sending, still receiving (peer's watcher exits 21)
 "$INTERCOM" close  --me backend --id "$ID" --force                # hard close both sides — only for a peer that is gone
 "$INTERCOM" list  [--me backend]                                  # channels + participants (+unread with --me); marks [half]
-"$INTERCOM" status --id "$ID"                                     # read-receipts, who's [done sending], watcher-armed warning
+"$INTERCOM" status --id "$ID"                                     # read-receipts, who's [done sending], watcher armed?, recent watcher kills / UNSTABLE
 "$INTERCOM" send  --me backend --id "$ID" --json '{"schema":"v2"}'  # validated typed payload
 ```
 
@@ -184,6 +205,8 @@ participant has closed their side.
   control and `tail` the channel each time — a self-poll you own beats a long block.
 - **Stop guard:** you may be blocked from ending a turn if you leave a channel
   open with no watcher armed — re-arm (`send … --watch` / `watch`) or `close` it, then stop.
+  It does NOT block on an UNSTABLE channel (see above). There it lets the turn
+  end and tells the user the sentinel is the delivery path.
 - **Don't `close --force` to tidy up.** Half-closing (plain `close`) says you're
   done without cutting the other side off; forcing is for a peer that is gone.
 - Override the 1h idle cap with `INTERCOM_WATCH_MAX_SECS`; the comms dir with

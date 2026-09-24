@@ -8,6 +8,11 @@
 # ids that appear in this session's transcript): the label alone is not a session
 # identity, since .state/<label>/ is shared by every session using that label.
 #
+# Exception: a channel whose watchers keep getting killed soon after arming
+# (memory pressure). A re-arm cannot hold there, and demanding one loops
+# arm → killed → blocked → arm. The stop is allowed instead, and the user is told
+# via systemMessage that the sentinel is the delivery path.
+#
 # Fail-open EVERYWHERE: a Stop guard must never wedge a session. Any uncertainty
 # -> allow the stop.
 #
@@ -22,6 +27,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTERCOM="$SELF_DIR/intercom.sh"
 
 allow() { exit 0; }   # let the stop proceed
+kv() { grep -m1 "^$1=" <<<"$health" | cut -d= -f2-; }   # key=value lookup in $health
 
 json_str() {  # JSON-encode $1 for the "reason" value
   if command -v python3 >/dev/null 2>&1; then
@@ -77,6 +83,7 @@ mine="$( { tail -c "$scan_bytes" "$transcript" | grep -oE '[0-9a-f]{6}-[0-9]{8}T
 [[ -d "$STATE_DIR/$me" ]] || allow
 shopt -s nullglob
 unguarded_id=""
+degraded=()     # one note per channel whose watchers are being reaped
 for wf in "$STATE_DIR/$me"/*; do
   id="$(basename "$wf")"
   # Same label, different session -> not ours to re-arm or to be nagged about.
@@ -95,15 +102,30 @@ for wf in "$STATE_DIR/$me"/*; do
   # again, so this is the final chance to leave something behind that can still
   # reach the human. Idempotent (pidfile-guarded) and returns immediately.
   "$INTERCOM" sentinel --me "$me" --id "$id" --spawn >/dev/null 2>&1 || true
-  # A live watcher = an intercom.sh process for this id running `watch`/`--watch`
-  # (the sentinel also carries the id, so exclude it — it is not a watcher).
-  if ps -Ao args= 2>/dev/null | grep -F 'intercom.sh' \
-       | grep -F -- "$id" | grep -vF 'sentinel' | grep -Eq 'watch'; then
+  # One probe for both questions: is a watcher armed, and do armed watchers
+  # survive? (Fail-open: if `health` itself fails, kv yields "" and we fall
+  # through to the plain re-arm nudge, same as before.)
+  health="$("$INTERCOM" health --me "$me" --id "$id" 2>/dev/null || true)"
+  [[ "$(kv watcher)" == 1 ]] && continue
+  # Re-arm is futile when the last few watchers were killed within minutes of
+  # arming. Don't block — hand delivery to the sentinel and say so.
+  if [[ "$(kv unstable)" == 1 ]]; then
+    note="${id}: watcher killed $(kv reaps_fast)x soon after arming (last lived $(kv last_lived)s)"
+    [[ "$(kv sentinel)" == 1 ]] \
+      && note+="; the sentinel will send a desktop notification when a message arrives" \
+      || note+="; NO sentinel is running, so nothing will notify you"
+    degraded+=("$note")
     continue
   fi
   unguarded_id="$id"; break
 done
-[[ -n "$unguarded_id" ]] || allow
+
+if [[ -z "$unguarded_id" ]]; then
+  (( ${#degraded[@]} )) || allow
+  msg="intercom: not re-arming — watchers keep getting killed (likely memory pressure). This session will NOT be woken by replies. $(printf '%s. ' "${degraded[@]}")Check the channel yourself (\`intercom.sh read\`) when notified."
+  printf '{"systemMessage":%s}\n' "$(json_str "$msg")"
+  exit 0
+fi
 
 reason="You still have an OPEN intercom channel ${unguarded_id} (as ${me}) with no watcher armed — you will NOT be woken if the other session replies. Before you stop, either re-arm it in the BACKGROUND ('${INTERCOM} watch --me ${me} --id ${unguarded_id}', or reply with 'send ... --watch'), or close it ('${INTERCOM} close --me ${me} --id ${unguarded_id}') if the conversation is finished."
 printf '{"decision":"block","reason":%s}\n' "$(json_str "$reason")"

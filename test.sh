@@ -22,6 +22,10 @@ WORK="$(mktemp -d)"; export INTERCOM_DIR="$WORK"
 trap 'rm -rf "$WORK"' EXIT
 # Force poll mode + fast idle budget for the watch tests.
 POLL=(env INTERCOM_WATCH_MAX_SECS=3 INTERCOM_POLL_SECS=1 PATH=/usr/bin:/bin)
+# Wait (up to 5s) for a watcher on $1 to show up in the process table — a fixed
+# `sleep 1` races watcher startup on a loaded machine.
+wait_watcher() { local i; for i in $(seq 50); do
+  ps -Ao args= | grep -F intercom.sh | grep -F -- "$1" | grep -q ' watch ' && return 0; sleep 0.1; done; }
 newid() { "$S" open --me "$1" ${2:+--topic "$2"} 2>/dev/null | grep -Eo 'id: .*' | sed 's/id: //'; }
 
 echo "== basic send/read =="
@@ -193,7 +197,7 @@ out="$(hookin "$TR" | "$GUARD")"; has "guard blocks open+no-watcher" "$out" '"de
 has "guard names the channel" "$out" "$IDG"
 # with a live watcher -> ALLOW
 ( "${POLL[@]}" INTERCOM_WATCH_MAX_SECS=8 "$S" watch --me G --id "$IDG" >/dev/null 2>&1 ) &
-WPID=$!; sleep 1
+WPID=$!; wait_watcher "$IDG"
 out="$(hookin "$TR" | "$GUARD")"; eq "guard allows when watcher live" "${out:-EMPTY}" "EMPTY"
 kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
 # stale open channel (untouched > 1h) -> ALLOW (abandoned, not mid-conversation)
@@ -234,6 +238,50 @@ eq "guard allows when only another session's channel is open" "${out:-EMPTY}" "E
 # A transcript with a label but no id at all -> fail open (never wedge a session).
 out="$(hookin "$(mkfake M)" | "$GUARD")"
 eq "guard fails open when no id in transcript" "${out:-EMPTY}" "EMPTY"
+
+echo "== reap tracking: a clean exit is not a reap =="
+IDK="$(newid A reaps)"; "$S" read --me B --id "$IDK" >/dev/null 2>&1
+NS=(env INTERCOM_NO_SENTINEL=1)
+"${NS[@]}" "${POLL[@]}" "$S" watch --me B --id "$IDK" >/dev/null 2>&1   # idle timeout, exit 10
+[[ -e "$WORK/.state/B/$IDK.reaps" ]] && bad "timeout logged as a reap" || ok "timeout is not a reap"
+ls "$WORK/.state/B/$IDK".watch.* >/dev/null 2>&1 && bad "clean exit left an arm record" || ok "clean exit removes arm record"
+
+echo "== reap tracking: SIGTERM is logged by the watcher itself =="
+"${NS[@]}" "${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me B --id "$IDK" > "$WORK/term.out" 2>&1 &
+WPID=$!; wait_watcher "$IDK"; sleep 0.5; kill -TERM "$WPID"; wait "$WPID"; rc=$?
+eq "reaped watcher exits 143" "$rc" "143"
+has "reaped watcher says so" "$(cat "$WORK/term.out")" "killed externally"
+has "TERM reap logged" "$(cat "$WORK/.state/B/$IDK.reaps" 2>/dev/null)" " TERM"
+ls "$WORK/.state/B/$IDK".watch.* >/dev/null 2>&1 && bad "TERM left an arm record" || ok "TERM removes arm record"
+st="$("$S" status --id "$IDK")"
+has "status reports the reap" "$st" "watcher reaped 1×"
+no  "one reap is not UNSTABLE" "$st" "UNSTABLE"
+
+echo "== reap tracking: SIGKILL leaves a record the next scan picks up =="
+"${NS[@]}" "${POLL[@]}" INTERCOM_WATCH_MAX_SECS=30 "$S" watch --me B --id "$IDK" >/dev/null 2>&1 &
+WPID=$!; wait_watcher "$IDK"; sleep 0.5; kill -KILL "$WPID"; wait "$WPID" 2>/dev/null
+h="$("$S" health --me B --id "$IDK")"
+has "SIGKILL reap logged as gone" "$(cat "$WORK/.state/B/$IDK.reaps")" " gone"
+has "two fast reaps => unstable" "$h" "unstable=1"
+has "health: no watcher" "$h" "watcher=0"
+has "status flags UNSTABLE" "$("$S" status --id "$IDK")" "UNSTABLE"
+out="$("${NS[@]}" "${POLL[@]}" INTERCOM_WATCH_MAX_SECS=2 "$S" watch --me B --id "$IDK" 2>&1)"
+has "arming on an unstable channel warns" "$out" "Do NOT tell the user"
+# Old reaps age out of the window.
+h="$(INTERCOM_REAP_WINDOW_SECS=0 "$S" health --me B --id "$IDK")"
+has "reaps outside the window don't count" "$h" "unstable=0"
+
+echo "== stop guard: backs off instead of looping on an unstable channel =="
+TRK="$(mkfake B "$IDK")"
+out="$(hookin "$TRK" | "$GUARD")"
+no  "guard does not block when re-arm cannot hold" "$out" '"decision":"block"'
+has "guard tells the user why" "$out" '"systemMessage"'
+has "guard names the channel" "$out" "$IDK"
+out="$(hookin "$TRK" | INTERCOM_REAP_WINDOW_SECS=0 "$GUARD")"
+has "guard blocks again once the reaps age out" "$out" '"decision":"block"'
+out="$(hookin "$TRK" | INTERCOM_REAP_WINDOW_SECS=0 INTERCOM_NO_PS=1 "$GUARD")"
+has "INTERCOM_NO_PS does not disable the guard" "$out" '"decision":"block"'
+for pf in "$WORK"/.state/B/"$IDK".sentinel.pid; do [[ -f "$pf" ]] && kill "$(cat "$pf")" 2>/dev/null; done
 
 echo "== crossed write: a send must not ack a message it never showed me =="
 # B writes while A is composing (no watcher armed — the watcher exits on delivery,
@@ -313,7 +361,7 @@ has "send names who won't wake" "$out" "B"
 "$S" read --me B --id "$IDN" >/dev/null 2>&1
 ( env INTERCOM_POLL_SECS=1 INTERCOM_WATCH_MAX_SECS=8 INTERCOM_NO_SENTINEL=1 PATH=/usr/bin:/bin \
     "$S" watch --me B --id "$IDN" >/dev/null 2>&1 ) &
-WPID=$!; sleep 1
+WPID=$!; wait_watcher "$IDN"
 out="$(INTERCOM_NO_SENTINEL=1 "$S" send --me A --id "$IDN" --msg three 2>&1)"
 no "no false alarm while a watcher lives" "$out" "no live watcher"
 wait $WPID 2>/dev/null || true
