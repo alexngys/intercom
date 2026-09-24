@@ -116,7 +116,8 @@ machine**:
 | `INTERCOM_SENTINEL_POLL_SECS` | `20` | Sentinel poll interval |
 | `INTERCOM_SENTINEL_GRACE_SECS` | `120` | How long an unread message may sit before the sentinel decides nobody is listening |
 | `INTERCOM_SENTINEL_RENOTIFY_SECS` | `1800` | Minimum gap between repeat notifications for the same unread message |
-| `INTERCOM_SENTINEL_MAX_SECS` | `86400` | Sentinel lifetime cap |
+| `INTERCOM_SENTINEL_IDLE_SECS` | `7200` | The sentinel stops covering a channel with no writes (or re-registration) for this long |
+| `INTERCOM_SENTINEL_MAX_SECS` | `86400` | Sentinel lifetime cap (it is restarted on demand) |
 | `INTERCOM_REAP_WINDOW_SECS` | `1800` | How far back watcher kills count toward UNSTABLE |
 | `INTERCOM_REAP_FAST_SECS` | `600` | A watcher killed younger than this counts as a fast reap |
 | `INTERCOM_REAP_LIMIT` | `2` | Fast reaps within the window that mark a channel UNSTABLE |
@@ -150,8 +151,15 @@ double-forked, `setsid`'d process that lives outside the session and survives th
 reap. It cannot wake the model — only a completing background task does that — so
 when a message sits unread with no watcher armed, it fires a desktop notification
 at the human instead. It is a pure observer: it never advances a watermark, never
-writes to the channel, and exits when the channel closes. Single-instance per
-`(label, channel)` via a pidfile under `.state/`.
+writes to the channel.
+
+There is **one sentinel per machine** (per `INTERCOM_DIR`), not one per channel.
+Every process costs about 1 MB even when it does nothing, so a sentinel for each
+channel was wasted memory. `watch` and the Stop guard add the channel to the
+sentinel's list under `.state/.sentinel/`, starting the sentinel if it isn't
+running. The sentinel drops a channel once it closes or has been idle for
+`INTERCOM_SENTINEL_IDLE_SECS`, and exits when its list is empty. With no live
+conversations, intercom runs no processes at all.
 
 Complementing it, `send` warns (and notifies) when the peer has no watcher armed,
 so a message is never left waiting on a session that cannot hear it.
@@ -224,7 +232,7 @@ ID=$("$S" open --me a --topic test | grep -oE '[a-f0-9]{6}-[0-9T]+Z' | head -1)
 | `read --me <label> --id <id>` | Print messages newer than your watermark, and advance it |
 | `tail --id <id> [-n N] [--me <label>]` | Raw last-N messages straight from the log — every message, ignores/touches no watermark; recovery / source-of-truth view |
 | `watch --me <label> --id <id>` | Block (background) until the other side writes; a **doorbell** — shows new messages but does not advance your watermark. Exits `0`=new msg, `10`=1h idle (alerts user), `20`=fully closed, `21`=peer half-closed. Also arms the sentinel |
-| `sentinel --me <label> --id <id> [--spawn]` | Out-of-session watchdog; `--spawn` detaches and returns. Notifies the human when a message is unread with no watcher armed |
+| `sentinel [--me <label> --id <id>] [--spawn]` | The machine's out-of-session watchdog. `--spawn` adds the channel to its list and starts it (detached) if needed; without `--spawn` it runs in the foreground. It notifies the human when a message is unread with no watcher armed |
 | `status [--me <label>] --id <id>` | Read-receipts: how far each participant has read, who is done sending, whether any watcher is armed, and recent watcher kills / UNSTABLE (no write, no wake) |
 | `health --me <label> --id <id>` | Machine-readable `key=value` watcher/reap state (what the Stop guard reads) |
 | `list [--me <label>]` | All channels + participants; with `--me`, an unread count. Marks `[half]` for half-closed |

@@ -140,7 +140,9 @@ watcher_running() {
   local id="$1" pid args
   while read -r pid args; do
     [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
-    [[ "$args" == *intercom.sh* && "$args" == *"$id"* && "$args" != *sentinel* ]] || continue
+    # Match the subcommand, not the bare word: an install path that happens to
+    # contain "sentinel" must not hide every watcher.
+    [[ "$args" == *intercom.sh* && "$args" == *"$id"* && "$args" != *"intercom.sh sentinel"* ]] || continue
     [[ "$args" == *" watch "* || "$args" == *" watch" || "$args" == *--watch* ]] && return 0
   done < <(ps -Ao pid=,args= 2>/dev/null)
   return 1
@@ -254,16 +256,28 @@ shown_seq() {
 # `<id>` watermark that `participants` globs for.
 fin_ackfile() { printf '%s\n' "$STATE_DIR/$1/$2.fin"; }
 
-# Sentinel bookkeeping. All suffixed, all outside the watermark namespace.
-sentinel_pidfile()  { printf '%s\n' "$STATE_DIR/$1/$2.sentinel.pid"; }
-sentinel_logfile()  { printf '%s\n' "$STATE_DIR/$1/$2.sentinel.log"; }
-
-sentinel_running() {
-  local pf pid; pf="$(sentinel_pidfile "$1" "$2")"
-  [[ -f "$pf" ]] || return 1
-  pid="$(cat "$pf" 2>/dev/null)"; [[ -n "$pid" ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+# Sentinel bookkeeping. ONE sentinel per comms dir (i.e. per machine) serves
+# every channel: a registry file per (label, channel) it should cover, plus a
+# `run/` singleton lock holding its pid. A dot-dir, so the per-label globs over
+# .state/* never see it.
+#   registry line: <registered_at> <deaf_since> <last_notified_seq> <last_notified_at>
+SENTINEL_DIR="$STATE_DIR/.sentinel"
+sentinel_reg()        { printf '%s\n' "$SENTINEL_DIR/$1@$2"; }
+sentinel_daemon_pid() { cat "$SENTINEL_DIR/run/pid" 2>/dev/null || true; }
+sentinel_daemon_alive() {
+  local pid; pid="$(sentinel_daemon_pid)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
+# Covered = the daemon is up AND this (label, channel) is on its list.
+sentinel_running() { sentinel_daemon_alive && [[ -f "$(sentinel_reg "$1" "$2")" ]]; }
+
+any_registered() {
+  local r
+  for r in "$SENTINEL_DIR"/*@*; do [[ -f "$r" ]] && return 0; done
+  return 1
+}
+
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 # ----------------------------------------------------------------------------
 # Reap tracking.
@@ -839,74 +853,146 @@ cmd_watch() {
 #
 # It is a pure observer: never advances a watermark, never writes a .peek, never
 # appends to the channel. Losing one costs nothing but the notification.
+#
+# One process covers every channel on the machine (a process costs ~1 MB however
+# little it does, so N per-channel sentinels were N MB for no benefit). Channels
+# register via `sentinel_reg`; the daemon drops a registration once the channel
+# closes, disappears, or goes idle, and exits when nothing is left — so with no
+# live conversations intercom runs no processes at all.
 cmd_sentinel() {
   parse_args "$@"
-  [[ -n "$ME" ]] || die "sentinel requires --me <label>"
-  [[ -n "$ID" ]] || die "sentinel requires --id <id>"
-  valid_label "$ME"
   ensure_dirs
+  if [[ -n "$ME" || -n "$ID" ]]; then
+    [[ -n "$ME" && -n "$ID" ]] || die "sentinel takes --me and --id together"
+    valid_label "$ME"
+  fi
+  if (( SPAWN )); then
+    [[ -n "$ME" ]] || die "sentinel --spawn requires --me <label> --id <id>"
+    spawn_sentinel "$ME" "$ID"; return 0
+  fi
+  [[ -n "$ME" ]] && sentinel_register "$ME" "$ID"
+  sentinel_daemon
+}
 
-  if (( SPAWN )); then spawn_sentinel "$ME" "$ID"; return 0; fi
+# Add (or refresh) a registration, keeping any notification state it had.
+sentinel_register() {
+  local reg rest=""
+  reg="$(sentinel_reg "$1" "$2")"
+  mkdir -p "$SENTINEL_DIR"
+  [[ -f "$reg" ]] && rest="$(cut -d' ' -f2- "$reg" 2>/dev/null || true)"
+  printf '%s %s\n' "$(date +%s)" "${rest:-0 0 0}" > "$reg"
+}
 
-  sentinel_running "$ME" "$ID" && { echo "sentinel already running for $ME/$ID"; return 0; }
+# Take the machine-wide singleton. Fails if a live daemon already holds it. A
+# lock left by a daemon that died without cleanup is stolen; a lock with no pid
+# yet belongs to a daemon that is starting, unless it has been that way a while.
+sentinel_claim() {
+  mkdir -p "$SENTINEL_DIR"
+  if ! mkdir "$SENTINEL_DIR/run" 2>/dev/null; then
+    sentinel_daemon_alive && return 1
+    if [[ -z "$(sentinel_daemon_pid)" && -z "$(find "$SENTINEL_DIR/run" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      return 1
+    fi
+    rm -rf "$SENTINEL_DIR/run"
+    mkdir "$SENTINEL_DIR/run" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" > "$SENTINEL_DIR/run/pid"
+  trap 'rm -rf "$SENTINEL_DIR/run" 2>/dev/null || true' EXIT
+}
 
-  local pf; pf="$(sentinel_pidfile "$ME" "$ID")"
-  mkdir -p "$(dirname "$pf")"; printf '%s\n' "$$" > "$pf"
-  # shellcheck disable=SC2064
-  trap "rm -f '$pf' 2>/dev/null || true" EXIT
-
+sentinel_daemon() {
+  sentinel_claim || { echo "[sentinel] already running (pid $(sentinel_daemon_pid))"; return 0; }
   local poll="${INTERCOM_SENTINEL_POLL_SECS:-20}"
-  local grace="${INTERCOM_SENTINEL_GRACE_SECS:-120}"     # let the real watcher win first
-  local renotify="${INTERCOM_SENTINEL_RENOTIFY_SECS:-1800}"
   local maxlife="${INTERCOM_SENTINEL_MAX_SECS:-86400}"
-  local deaf_since=0 last_seq=0 last_at=0
-  local path shown inbound
-
-  echo "[sentinel] watching $ID as $ME (pid $$, poll ${poll}s, grace ${grace}s)"
+  local reg live
+  # Keep the shared log bounded; it only ever holds notification history.
+  if [[ -f "$SENTINEL_DIR/log" ]] && (( $(wc -c < "$SENTINEL_DIR/log") > 1048576 )); then
+    : > "$SENTINEL_DIR/log"
+  fi
+  echo "[sentinel] $(now_utc) started (pid $$, poll ${poll}s)"
   SECONDS=0
   while (( SECONDS < maxlife )); do
     sleep "$poll"
-    path="$(channel_path "$ID")"
-    [[ -n "$path" ]] || { echo "[sentinel] channel file gone; exiting"; return 0; }
-    if [[ -n "$(closed_by "$path")" ]]; then
-      echo "[sentinel] channel closed; exiting"
-      return 0
-    fi
-    # The sentinel is the one process that outlives a SIGKILLed watcher, so it is
-    # the scanner that dates those deaths accurately (to within one poll).
-    reap_scan "$ME" "$ID"
-    shown="$(shown_seq "$ME" "$ID")"
-    inbound="$(max_inbound_seq "$path" "$ME")"; inbound="${inbound:-0}"
-    if (( inbound <= shown )); then deaf_since=0; continue; fi
-    # Unread. If a watcher is armed it will deliver — that's the normal path.
-    if watcher_running "$ID"; then deaf_since=0; continue; fi
-    (( deaf_since == 0 )) && deaf_since=$SECONDS
-    (( SECONDS - deaf_since < grace )) && continue
-    if (( inbound != last_seq || SECONDS - last_at >= renotify )); then
-      echo "[sentinel] $(now_utc) unread MSG $inbound, no watcher armed — notifying"
-      alert_user "intercom: $ME is not listening on $ID" \
-                 "MSG $inbound is unread and no watcher is armed - that session was reaped and needs a poke."
-      last_seq=$inbound; last_at=$SECONDS
-    fi
+    live=0
+    for reg in "$SENTINEL_DIR"/*@*; do
+      [[ -f "$reg" ]] || continue
+      sentinel_check "$reg" && live=$((live + 1))
+    done
+    (( live )) && continue
+    # Nothing left to cover: release the lock, THEN look again. A spawner that
+    # saw us alive a moment ago registered before it looked, so its entry is
+    # visible now; and one that looks after the release starts a fresh daemon.
+    # Either way no registration is left without a sentinel.
+    rm -rf "$SENTINEL_DIR/run"; trap - EXIT
+    any_registered || { echo "[sentinel] $(now_utc) nothing left to watch; exiting"; return 0; }
+    sentinel_claim || return 0          # another daemon took over
   done
   echo "[sentinel] max lifetime reached; exiting"
 }
 
-# Detach a sentinel from this process tree and return immediately. Double-fork +
-# setsid so it is reparented to init with no controlling terminal — a session-wide
-# reap or a Claude Code restart must not take it with them. macOS ships no
-# setsid(1), hence python3; the nohup fallback is weaker (survives SIGHUP only)
-# but better than nothing.
+# One pass over one registration. Returns 1 when the registration was retired.
+sentinel_check() {
+  local reg="$1" key me id path now idle_from shown inbound
+  local registered deaf_since last_seq last_at
+  local grace="${INTERCOM_SENTINEL_GRACE_SECS:-120}"     # let the real watcher win first
+  local renotify="${INTERCOM_SENTINEL_RENOTIFY_SECS:-1800}"
+  local idle="${INTERCOM_SENTINEL_IDLE_SECS:-7200}"
+  key="$(basename "$reg")"; me="${key%%@*}"; id="${key#*@}"
+  now="$(date +%s)"
+
+  path="$(channel_path "$id")"
+  if [[ -z "$path" || -n "$(closed_by "$path")" ]]; then
+    echo "[sentinel] $(now_utc) $me@$id closed or gone; dropping it"
+    rm -f "$reg"; return 1
+  fi
+  read -r registered deaf_since last_seq last_at < "$reg" 2>/dev/null || true
+  registered="${registered:-$now}"; deaf_since="${deaf_since:-0}"
+  last_seq="${last_seq:-0}"; last_at="${last_at:-0}"
+  # Idle = no write to the channel AND no (re)registration for a while. The
+  # registration counts so joining an old, quiet channel isn't dropped at once.
+  idle_from="$(file_mtime "$path")"; (( registered > idle_from )) && idle_from=$registered
+  if (( now - idle_from > idle )); then
+    echo "[sentinel] $(now_utc) $me@$id idle for $(( (now - idle_from) / 60 ))m; dropping it"
+    rm -f "$reg"; return 1
+  fi
+
+  # The sentinel is the one process that outlives a SIGKILLed watcher, so it is
+  # the scanner that dates those deaths accurately (to within one poll).
+  reap_scan "$me" "$id"
+  shown="$(shown_seq "$me" "$id")"
+  inbound="$(max_inbound_seq "$path" "$me")"; inbound="${inbound:-0}"
+  # Nothing unread, or a watcher is armed to deliver it: the normal path.
+  if (( inbound <= shown )) || watcher_running "$id"; then
+    deaf_since=0
+  else
+    (( deaf_since == 0 )) && deaf_since=$now
+    if (( now - deaf_since >= grace )) && (( inbound != last_seq || now - last_at >= renotify )); then
+      echo "[sentinel] $(now_utc) $me@$id unread MSG $inbound, no watcher armed — notifying"
+      alert_user "intercom: $me is not listening on $id" \
+                 "MSG $inbound is unread and no watcher is armed - that session was reaped and needs a poke."
+      last_seq=$inbound; last_at=$now
+    fi
+  fi
+  printf '%s %s %s %s\n' "$registered" "$deaf_since" "$last_seq" "$last_at" > "$reg"
+  return 0
+}
+
+# Register (me, id) and make sure the machine's sentinel is running, detached
+# from this process tree. Register FIRST, then check the daemon: see the exit
+# handshake in sentinel_daemon. Double-fork + setsid so it is reparented to init
+# with no controlling terminal — a session-wide reap or a Claude Code restart must
+# not take it with them. macOS ships no setsid(1), hence python3; the nohup
+# fallback is weaker (survives SIGHUP only) but better than nothing.
 spawn_sentinel() {
-  local me="$1" id="$2" log self
-  sentinel_running "$me" "$id" && return 0
-  log="$(sentinel_logfile "$me" "$id")"
-  mkdir -p "$(dirname "$log")"
+  local log self
+  sentinel_register "$1" "$2"
+  sentinel_daemon_alive && return 0
+  log="$SENTINEL_DIR/log"
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   if command -v python3 >/dev/null 2>&1; then
     INTERCOM_DIR="$COMMS_DIR" python3 -c '
 import os, sys
-script, me, cid, log = sys.argv[1:5]
+script, log = sys.argv[1:3]
 if os.fork() > 0: sys.exit(0)          # parent returns to the shell at once
 os.setsid()                            # new session: no controlling terminal
 if os.fork() > 0: os._exit(0)          # grandchild cannot reacquire one
@@ -914,10 +1000,10 @@ os.chdir("/")
 fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.dup2(fd, 1); os.dup2(fd, 2)
 null = os.open(os.devnull, os.O_RDONLY); os.dup2(null, 0)
-os.execv(script, [script, "sentinel", "--me", me, "--id", cid])
-' "$self" "$me" "$id" "$log" 2>/dev/null || true
+os.execv(script, [script, "sentinel"])
+' "$self" "$log" 2>/dev/null || true
   else
-    INTERCOM_DIR="$COMMS_DIR" nohup "$self" sentinel --me "$me" --id "$id" >>"$log" 2>&1 &
+    INTERCOM_DIR="$COMMS_DIR" nohup "$self" sentinel >>"$log" 2>&1 &
     disown 2>/dev/null || true
   fi
 }
