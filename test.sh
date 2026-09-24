@@ -107,6 +107,20 @@ out="$("$S" send --me A --id "$IDH" --msg "actually one more" 2>&1)"
 has "sending reopens my half" "$out" "reopens it"
 no "my FIN was retracted" "$("$S" close --me B --id "$IDH" 2>&1)" "all participants half-closed"
 
+echo "== close warns when the peer spoke last and got no reply =="
+IDE2="$(newid A)"
+"$S" send --me A --id "$IDE2" --msg "q?" >/dev/null; "$S" send --me B --id "$IDE2" --msg "one more thing" >/dev/null
+out="$("$S" close --me A --id "$IDE2" 2>&1)"
+has "unreplied close warns" "$out" "closing too early"
+has "half-close says keep watching" "$out" "Keep your watcher armed"
+IDE3="$(newid A)"
+"$S" send --me B --id "$IDE3" --msg "done on my side" >/dev/null; "$S" send --me A --id "$IDE3" --msg "thanks" >/dev/null 2>&1
+no "no warning when I spoke last" "$("$S" close --me A --id "$IDE3" 2>&1)" "closing too early"
+IDE4="$(newid A)"
+"$S" send --me A --id "$IDE4" --msg x >/dev/null 2>&1; "$S" send --me B --id "$IDE4" --msg bye >/dev/null
+"$S" close --me B --id "$IDE4" >/dev/null 2>&1
+no "no warning when peer already half-closed" "$("$S" close --me A --id "$IDE4" 2>&1)" "closing too early"
+
 echo "== close --force ends it even with a live peer =="
 IDF="$(newid A)"
 "$S" send --me A --id "$IDF" --msg x >/dev/null; "$S" read --me B --id "$IDF" >/dev/null 2>&1

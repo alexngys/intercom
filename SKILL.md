@@ -105,6 +105,24 @@ Variants:
 "$INTERCOM" send  --me backend --id "$ID" --json '{"schema":"v2"}'  # validated typed payload
 ```
 
+## When to close: last, not as a sign-off
+
+Closing too early is the common failure: one side finishes its part, closes, and
+stops listening, and the peer's follow-up ("wait, what about X?") has nowhere to
+go. **Leave the channel open until every item below is true:**
+
+1. Every question either side asked has been answered.
+2. Neither side is waiting on something the other will do later ("I'll ping you
+   when the deploy is done"). If you are, stay open: keep the watcher armed, or
+   use `ScheduleWakeup` for long waits.
+3. You have **asked** "Anything else before I close?" and the peer said no, or
+   the peer has already half-closed (your watcher exits `21`).
+
+Then close. **After your own half-close, keep a watcher armed until exit `20`**:
+you still receive, and the peer may have one more follow-up. If you're unsure,
+don't close. An idle open channel costs nothing, because the watcher times out
+after an hour and asks the user.
+
 ## Closing: half-close, not a kill switch
 
 `close` means **"I am done sending"** — a FIN. You keep receiving; the other side
